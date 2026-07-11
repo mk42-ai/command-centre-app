@@ -18,6 +18,9 @@ import { syncInbox, refreshCache, generateDailyBriefing, rebuildDashboard, detec
 import { kv } from './server/lib/cache.js';
 // v25: single shared OnDemand client — the ONLY code path to api.on-demand.io
 import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs, offlineSuggestions } from './server/lib/ondemand.js';
+// v30: copilot session lifecycle — boot warm-up + lazy re-init on drop
+import { warmupCopilotSession, ensureCopilotSession, reinitCopilotSession, copilotSessionStatus } from './server/lib/session.js';
+import { envReconciliation } from './server/lib/env.js';
 import { sendMailDirect } from './server/lib/mail.js';
 import { mergeRecords as wfMergeRecords, pollWorkflowOnce as wfPollOnce, ingestState as wfIngestState, WF_CONFIG } from './server/lib/workflow-ingest.js';
 import { logger, requestLogger } from './server/lib/logger.js';
@@ -96,14 +99,24 @@ const PORT = Number(process.env.PORT || 5173);
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'v29',
-    keyConfigured: Boolean(API_KEY),
+    version: 'v31',
+    keyConfigured: odConfigured(),               // v30: derive from live client (post env-reconciliation)
+    baseUrl: BASE_URL,                           // v30: proves the /chat/v1-normalized base is in effect
     suggestRoute: true,
     supervision: true,
     draftEndpointId: DRAFT_ENDPOINT_ID,
     sendEndpointId: SEND_ENDPOINT_ID,
     mediaBaseUrl: MEDIA_BASE_URL,
     uploadRoute: true,
+    // v31 fixes surfaced for verification
+    mailProvider: CONFIG.mailProvider,           // 'ondemand' (live) — seed disabled by default
+    mailLookbackDays: CONFIG.mail.lookbackDays,  // 7-day recency window
+    mailFetchTtlS: CONFIG.mail.fetchTtlS,        // short inbox cache
+    liveMailRoute: '/api/mail/fetch',
+    docSelectRoute: '/api/documents/select',
+    structuredSendRoute: '/api/send-structured',
+    copilotSession: copilotSessionStatus(),      // v30: warm-session readiness + reinit count
+    envReconciliation,                            // v30: which ON_DEMAND_*→ONDEMAND_* aliases fired
     ts: new Date().toISOString(),
   });
 });
@@ -174,7 +187,9 @@ app.post('/api/query', async (req, res) => {
     // v21 parser adopts it automatically.
     if (upstream.status === 404) {
       try {
-        const freshId = await odCreateSession({ contextMetadata: [{ key: 'app', value: 'meera-command-centre' }, { key: 'recovery', value: 'stale-session-404' }] });
+        // v30: re-mint through the session manager so the warm cached session
+        // is replaced (not just a throwaway id) — the next request reuses it.
+        const freshId = await reinitCopilotSession('query-stale-session-404');
         if (freshId) upstream = await streamOnce(String(freshId));
       } catch { /* fall through to the error branch below */ }
     }
@@ -527,9 +542,18 @@ app.use(express.static(dist, { index: 'index.html', maxAge: '1h' }));
 app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Meera's Command Centre v25 listening on 0.0.0.0:${PORT} — key configured: ${odConfigured()}`);
+  console.log(`Meera's Command Centre v30 listening on 0.0.0.0:${PORT} — key configured: ${odConfigured()} — base: ${BASE_URL}`);
+  if (envReconciliation.aliased.length || envReconciliation.baseUrlNormalized) {
+    console.log(`[v30] env reconciled — aliases: [${envReconciliation.aliased.join(', ') || 'none'}] baseUrlNormalized: ${envReconciliation.baseUrlNormalized}`);
+  }
   const cronOn = startCron();
   console.log(`[v19] backend layer up — cron ${cronOn ? 'enabled' : 'disabled'} (${JSON.stringify(CONFIG.cron)})`);
+  // v30: warm the copilot chat session on boot (retry + backoff, never throws)
+  // so the FIRST /api/query already has a live session instead of racing a
+  // cold create. Lazy re-init still covers drops/404s during runtime.
+  warmupCopilotSession().then((sid) => {
+    console.log(`[v30] copilot session warm-up: ${sid ? `ready (${sid})` : 'deferred (will lazy-init on first request)'}`);
+  }).catch(() => {});
   // boot warm-up: one incremental sync primes the cache so the very first
   // dashboard request is served hot; failures fall back to lastGood state.
   syncInbox({}).then((r) => {

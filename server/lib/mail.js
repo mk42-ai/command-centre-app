@@ -309,46 +309,162 @@ export class SeedProvider {
 }
 
 // ------------------------------------------------------------
-// Provider factory: MAIL_PROVIDER=zoho | seed (gmail reserved).
-// Default: zoho when fully configured, else seed fallback so the
-// dashboard never renders empty.
+// v31 — OnDemandMailProvider: LIVE inbox via the OnDemand mail agent.
+// This is the DEFAULT provider. listMessages() delegates to the fresh-
+// session, cache-busted, last-N-days-newest-first fetch in ondemand-mail.js
+// and normalises each result into the Gmail-shaped record the pipeline
+// expects. It NEVER returns seed data — a missing/blocked credential throws
+// a clear error the route surfaces as a 5xx (root-cause fix for "always the
+// same old emails").
+// ------------------------------------------------------------
+export class OnDemandMailProvider {
+  constructor() { this.name = 'ondemand'; }
+  configured() { return Boolean(process.env.ONDEMAND_API_KEY); }
+
+  async listMessages({ afterEpochMs = null, maxResults = null } = {}) {
+    const { fetchRecentMail } = await import('./ondemand-mail.js');
+    const lookbackDays = afterEpochMs
+      ? Math.max(1, Math.ceil((Date.now() - afterEpochMs) / 86400000))
+      : CONFIG.mail.lookbackDays;
+    const res = await fetchRecentMail({ lookbackDays, maxResults: maxResults || CONFIG.mail.maxResults });
+    // normalise → Gmail shape (already newest-first from fetchRecentMail)
+    return res.emails.map((m) => {
+      const ms = m.dateMs || Date.now();
+      const addr = parseAddress(m.sender || m.email || 'unknown');
+      return {
+        id: m.id,
+        threadId: m.id, // one-message threads unless the agent supplies threadId
+        historyId: String(ms),
+        labelIds: ['INBOX'],
+        snippet: String(m.body || '').slice(0, 300),
+        internalDate: String(ms),
+        sizeEstimate: String(m.body || '').length,
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'Subject', value: m.subject || '(no subject)' },
+            { name: 'From', value: m.sender || m.email || 'unknown' },
+            { name: 'To', value: CONFIG.mail.mailbox },
+            { name: 'Date', value: new Date(ms).toUTCString() },
+            { name: 'Message-ID', value: `<${m.id}@ondemand>` },
+          ],
+        },
+        body: m.body || '',
+        zoho: null,
+        source: 'ondemand-live',
+      };
+    });
+  }
+
+  async getProfile() { return { emailAddress: CONFIG.mail.mailbox, historyId: String(Date.now()), provider: 'ondemand' }; }
+  async getThread(threadId) {
+    const msgs = (await this.listMessages()).filter((m) => m.threadId === threadId);
+    return { id: threadId, historyId: msgs[0]?.historyId || null, messages: msgs };
+  }
+  async getMessage(id) {
+    const m = (await this.listMessages()).find((x) => x.id === id);
+    return { id, body: m?.body || '', bodyText: String(m?.body || '').replace(/<[^>]+>/g, ' ').trim() };
+  }
+}
+
+// ------------------------------------------------------------
+// Provider factory: MAIL_PROVIDER=ondemand (default) | zoho | seed.
+// v31 (FIX #1): the LIVE OnDemand provider is the default and ONLY automatic
+// path. Seed is used ONLY when a human explicitly sets MAIL_PROVIDER=seed
+// (or ALLOW_SEED_FALLBACK=1). A missing live credential throws a CLEAR ERROR
+// instead of silently replaying the stale fixture snapshot.
 // ------------------------------------------------------------
 let _provider = null;
 export async function getMailProvider() {
   if (_provider) return _provider;
   const forced = CONFIG.mailProvider;
-  // v25 (BE-16): surface misconfiguration instead of silently absorbing it
-  if (forced && !['zoho', 'seed', 'gmail'].includes(forced)) {
-    console.warn(`[mail] unknown MAIL_PROVIDER="${forced}" — falling back to auto (zoho-if-configured, else seed)`);
-  }
-  if (forced === 'gmail') console.warn('[mail] MAIL_PROVIDER=gmail is reserved; using zoho-compatible provider');
-  const zoho = new ZohoMailProvider();
-  if (forced === 'zoho') { _provider = zoho; return _provider; }
-  if (forced === 'seed' || !zoho.configured()) {
+
+  // Explicit seed demo mode (opt-in only).
+  if (forced === 'seed') {
+    if (!CONFIG.allowSeedFallback && process.env.MAIL_PROVIDER !== 'seed') {
+      throw new Error('[mail] seed provider is disabled. Set MAIL_PROVIDER=seed explicitly (demo only).');
+    }
+    console.warn('[mail] MAIL_PROVIDER=seed — replaying STATIC fixture (NOT live mail). Demo mode only.');
     const dataMod = await import('../../src/data.js');
     _provider = SeedProvider.fromDataModule(dataMod);
     return _provider;
   }
-  _provider = zoho;
+
+  // Explicit Zoho REST mode.
+  if (forced === 'zoho' || forced === 'gmail') {
+    const zoho = new ZohoMailProvider();
+    if (!zoho.configured()) {
+      throw new Error('[mail] MAIL_PROVIDER=zoho but Zoho credentials are missing (ZOHO_ACCOUNT_ID + ZOHO_API_KEY or OAuth triple). Refusing to fall back to seed — configure the Zoho credential.');
+    }
+    _provider = zoho;
+    return _provider;
+  }
+
+  // DEFAULT: live OnDemand mail provider.
+  const od = new OnDemandMailProvider();
+  if (!od.configured()) {
+    throw new Error('[mail] live OnDemand mail provider requires ONDEMAND_API_KEY. It is missing — refusing to silently fall back to seed data. Set ONDEMAND_API_KEY (or MAIL_PROVIDER=seed for an explicit demo).');
+  }
+  _provider = od;
   return _provider;
 }
 export function resetMailProvider() { _provider = null; }
 
 
+const EMAIL_RE_M = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * v31 (FIX #2) — buildStructuredEmailHtml: turn a plain/multi-section reply
+ * body into a well-formed HTML email so the DISPATCHED message always carries
+ * the full, formatted content (the audit found the agent path dropped the
+ * body entirely). Preserves blank-line paragraph separation and lists the
+ * attached documents in a footer section.
+ */
+export function buildStructuredEmailHtml({ body, attachments = [] }) {
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const paras = String(body).trim().split(/\n{2,}/).map((p) => `<p style="margin:0 0 12px;line-height:1.5">${esc(p).replace(/\n/g, '<br>')}</p>`).join('\n');
+  const attachHtml = attachments && attachments.length
+    ? `<hr style="border:none;border-top:1px solid #e2e2e2;margin:16px 0">` +
+      `<p style="margin:0 0 6px;font-size:13px;color:#555"><strong>Attached document${attachments.length > 1 ? 's' : ''}:</strong></p>` +
+      `<ul style="margin:0;padding-left:18px;font-size:13px;color:#555">${attachments.map((a) => `<li>${esc(a.name)}</li>`).join('')}</ul>`
+    : '';
+  return `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;color:#1a1a1a">${paras}${attachHtml}</div>`;
+}
+
 // ------------------------------------------------------------
-// v25 — sendMailDirect(): module-level direct-send entry point.
-// Uses the real Zoho REST path when credentials are configured;
-// otherwise returns a structured miss so callers fall back to the
-// agent-driven /api/send path instead of throwing blind 500s.
+// v31 (FIX #2) — sendMailDirect(): direct structured send with a FULLY
+// HYDRATED, VALIDATED body. Unlike v29 (which dropped the body onto an LLM
+// agent prompt), this ALWAYS carries the body in the mail payload's `content`
+// field and REFUSES to send an empty body. When Zoho REST creds are present it
+// dispatches a real email; otherwise it returns a clear structured error
+// (ok:false, reason) — it NEVER silently succeeds without delivering the body.
 // ------------------------------------------------------------
-export async function sendMailDirect({ toAddress, subject, content, attachments = [] }) {
+export async function sendMailDirect({ toAddress, subject, content, contentHtml = null, attachments = [] }) {
+  // HARD body validation — never dispatch an empty-body email.
+  const bodyText = String(content || '').trim();
+  if (!bodyText) {
+    return { ok: false, reason: 'empty-body', error: 'refusing to send: email body (content) is empty', ts: new Date().toISOString() };
+  }
+  if (!EMAIL_RE_M.test(String(toAddress || '').trim())) {
+    return { ok: false, reason: 'invalid-recipient', error: `refusing to send: toAddress "${toAddress}" is not a valid email`, ts: new Date().toISOString() };
+  }
+  const html = contentHtml || buildStructuredEmailHtml({ body: bodyText, attachments });
   const zoho = new ZohoMailProvider();
   if (!zoho.configured()) {
-    return { ok: false, reason: 'zoho-not-configured', fallback: 'agent-send', ts: new Date().toISOString() };
+    // Clear, honest miss — the caller must NOT report a successful send.
+    return {
+      ok: false,
+      reason: 'zoho-not-configured',
+      error: 'Zoho REST credentials are not configured on this deployment (ZOHO_ACCOUNT_ID + ZOHO_API_KEY/OAuth). The structured body was built and validated but no live mail transport is available to dispatch it.',
+      bodyChars: bodyText.length,
+      attachmentsPrepared: attachments.length,
+      builtHtmlChars: html.length,
+      ts: new Date().toISOString(),
+    };
   }
   try {
-    const r = await zoho.sendEmail({ toAddress, subject, content, attachments });
-    return { ok: true, provider: 'zoho-rest', ...r, ts: new Date().toISOString() };
+    const r = await zoho.sendEmail({ toAddress, subject, content: html, attachments });
+    return { ok: true, provider: 'zoho-rest', bodyChars: bodyText.length, ...r, ts: new Date().toISOString() };
   } catch (e) {
     return { ok: false, provider: 'zoho-rest', error: String(e?.message || e), status: e?.status || null, ts: new Date().toISOString() };
   }

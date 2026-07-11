@@ -174,7 +174,7 @@ export async function queryStream(sessionId, query, { endpointId = null, modelCo
  * statuses (parity with the v25 contract) — only for exhausted retries on
  * network/timeout, which callers already handle via try/catch.
  */
-export async function querySync(sessionId, query, { endpointId = null, temperature = 0.2, timeoutMs = null, retries = 2 } = {}) {
+export async function querySync(sessionId, query, { endpointId = null, temperature = 0.2, timeoutMs = null, retries = 2, agentIds = null } = {}) {
   let attempts = 0;
   const t0 = Date.now();
   try {
@@ -186,7 +186,9 @@ export async function querySync(sessionId, query, { endpointId = null, temperatu
         body: JSON.stringify({
           endpointId: endpointId || SEND_ENDPOINT_ID(),
           query: String(query),
-          agentIds: AGENT_IDS(),
+          // v31: allow a per-call agent override (mail-fetch routes to the
+          // Zoho-mail agent; default stays the copilot chat agent).
+          agentIds: Array.isArray(agentIds) && agentIds.length ? agentIds : AGENT_IDS(),
           responseMode: 'sync',
           modelConfigs: fullModelConfigs({ temperature }),
         }),

@@ -64,16 +64,20 @@ export async function syncInbox({ force = false, maxResults = 100 } = {}) {
     if (prev && prev.checksum === csum && !force) { state.counts.skipped++; continue; } // idempotent skip
     state.processed[m.id] = { checksum: csum, threadId: m.threadId, at: Date.now() };
     newOrChanged.push({ m, csum, changed: Boolean(prev) });
-    // email metadata cache — the dashboard's raw source
+    // email metadata cache — the dashboard's raw source.
+    // v31 (FIX #1): SHORT TTL (CONFIG.mail.fetchTtlS, default 3 min) instead of
+    // the old 24h (defaultTtlS*4) so fresh inbox mail is never masked by a
+    // day-old cached copy. Also persists the full `body` from the live fetch.
     kv.set(NS.EMAIL_META, m.id, {
       id: m.id, threadId: m.threadId, historyId: m.historyId,
       subject: headerValue(m, 'Subject'), from: parseAddress(headerValue(m, 'From')),
       to: headerValue(m, 'To'), date: headerValue(m, 'Date'),
       internalDate: Number(m.internalDate), snippet: m.snippet,
+      body: m.body || m.snippet || '',
       labelIds: m.labelIds, zoho: m.zoho || null, checksum: csum,
       seedMeta: m.seedMeta || null,
       cachedAt: nowIso(),
-    }, CONFIG.cache.defaultTtlS * 4);
+    }, CONFIG.mail.fetchTtlS || CONFIG.cache.defaultTtlS);
     state.lastInternalDate = Math.max(state.lastInternalDate || 0, Number(m.internalDate) || 0);
   }
 

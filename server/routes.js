@@ -24,6 +24,9 @@ import {
   syncInbox, getSyncState, rebuildDashboard, detectFollowups,
   generateDailyBriefing, refreshCache, profileSender, semanticSearch, analyzeThread,
 } from './functions/pipeline.js';
+// v31: live mail + file-directory orchestration (fixes #1 fetch, #2 send, #3 attach)
+import { fetchRecentMail, listCompanyFiles, selectRelevantDocument, uploadAttachmentFromUrl, mailConfigured } from './lib/ondemand-mail.js';
+import { sendMailDirect, buildStructuredEmailHtml } from './lib/mail.js';
 
 export const api = Router();
 
@@ -43,6 +46,119 @@ api.post('/inbox/sync', async (req, res) => {
   } catch (e) {
     res.status(502).json({ ok: false, error: String(e?.message || e), syncState: getSyncState() });
   }
+});
+
+// ============================================================
+// v31 (FIX #1) — LIVE inbox fetch: last N days, newest-first, structured
+// JSON with full body. Fresh session + cache-buster per call; NEVER seed.
+// GET/POST /api/mail/fetch?days=7&limit=50
+// ============================================================
+api.all('/mail/fetch', async (req, res) => {
+  if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).json({ ok: false, error: 'method not allowed' });
+  const days = Number(req.query.days || req.body?.days) || undefined;
+  const limit = Number(req.query.limit || req.body?.limit) || undefined;
+  try {
+    const r = await fetchRecentMail({ lookbackDays: days, maxResults: limit });
+    return res.json({ ok: true, ...r });
+  } catch (e) {
+    // Clear error — we do NOT fall back to seed data (root-cause fix #1).
+    return res.status(e?.status || 502).json({
+      ok: false, provider: 'ondemand-live', code: e?.code || 'MAIL_FETCH_FAILED',
+      error: String(e?.message || e), rawAnswer: e?.rawAnswer || undefined,
+      note: 'Live OnDemand mail fetch failed. Seed fallback is intentionally disabled — configure a valid OnDemand mail agent/credential.',
+      ts: new Date().toISOString(),
+    });
+  }
+});
+
+// ============================================================
+// v31 (FIX #3a) — semantic document selection over the company file
+// directory. POST /api/documents/select { subject, body, sender?, org? }
+// Returns the best-matching document + the ranked shortlist (no download).
+// ============================================================
+api.post('/documents/select', async (req, res) => {
+  const { subject = '', body = '', summary = '', sender = '', org = '' } = req.body || {};
+  if (!subject && !body && !summary) return res.status(400).json({ ok: false, error: 'subject or body/summary is required for document selection' });
+  try {
+    const files = await listCompanyFiles();
+    const sel = selectRelevantDocument({ subject, body, summary, sender, org }, files);
+    return res.json({
+      ok: true, directoryCount: files.length, documentCount: files.filter((f) => f.isDoc).length,
+      best: sel.best, ranked: sel.ranked, reason: sel.reason, ts: new Date().toISOString(),
+    });
+  } catch (e) {
+    return res.status(e?.status || 502).json({ ok: false, error: String(e?.message || e), ts: new Date().toISOString() });
+  }
+});
+
+// ============================================================
+// v31 (FIX #2 + #3) — structured send with REAL binary attachment.
+// POST /api/send-structured { toAddress?, subject, body, autoSelectDoc?,
+//   attachments?:[{name,url}], context?:{subject,body,sender,org} }
+//   • builds a structured HTML body from `body` (validated non-empty),
+//   • if autoSelectDoc, semantically picks the best company document,
+//   • uploads each attachment as a REAL FILE (media/v1/public/file/raw),
+//   • dispatches via sendMailDirect (Zoho REST when configured).
+// Requires x-send-approved: true (parity with the existing send gate).
+// Default recipient: mk@airev.ae.
+// ============================================================
+api.post('/send-structured', async (req, res) => {
+  const approved = String(req.headers['x-send-approved'] || req.body?.sendApproved || '').toLowerCase() === 'true';
+  const { toAddress = CONFIG.mail.mailbox, subject = '(no subject)', body = '', autoSelectDoc = false } = req.body || {};
+  const bodyText = String(body || '').trim();
+  if (!bodyText) return res.status(400).json({ ok: false, error: 'body must be non-empty (fix #2: never send an empty-body email)' });
+
+  // 1. Resolve attachments — explicit list and/or semantic auto-selection.
+  //    (Selection is a cheap directory read; the expensive binary upload is
+  //    deferred until AFTER the approval gate so a dry-run stays fast.)
+  const attachmentsIn = Array.isArray(req.body?.attachments) ? req.body.attachments.slice() : [];
+  let selection = null;
+  try {
+    if (autoSelectDoc) {
+      const ctx = req.body?.context || { subject, body: bodyText };
+      const files = await listCompanyFiles();
+      selection = selectRelevantDocument(ctx, files);
+      if (selection.best) attachmentsIn.push({ name: selection.best.name, url: selection.best.url });
+    }
+  } catch (e) {
+    return res.status(e?.status || 502).json({ ok: false, stage: 'doc-select', error: String(e?.message || e) });
+  }
+
+  // 2. Approval gate FIRST (before any upload/dispatch). Dry-run returns the
+  //    selected document + validated body without spending an upload.
+  if (!approved) {
+    return res.status(403).json({
+      ok: false, status: 'blocked-approval-required', dryRun: true,
+      error: 'send blocked: explicit user approval required (x-send-approved: true)',
+      preview: { toAddress, subject, bodyChars: bodyText.length, willAttach: attachmentsIn.map((a) => a.name), autoSelected: selection?.best ? { name: selection.best.name, score: selection.best.score } : null },
+      ts: new Date().toISOString(),
+    });
+  }
+
+  // 3. Upload each attachment as a REAL binary file (not prompt text).
+  const uploaded = [];
+  try {
+    for (const a of attachmentsIn) {
+      if (!a?.url || !a?.name) continue;
+      const up = await uploadAttachmentFromUrl({ url: a.url, name: a.name });
+      uploaded.push({ name: up.name, url: up.url, id: up.id, sizeBytes: up.sizeBytes });
+    }
+  } catch (e) {
+    return res.status(e?.status || 502).json({ ok: false, stage: 'attachment-upload', error: String(e?.message || e) });
+  }
+  const contentHtml = buildStructuredEmailHtml({ body: bodyText, attachments: uploaded });
+  const sent = await sendMailDirect({ toAddress, subject, content: bodyText, contentHtml, attachments: uploaded });
+  const httpCode = sent.ok ? 200 : (sent.reason === 'zoho-not-configured' ? 502 : 400);
+  return res.status(httpCode).json({
+    ...sent,
+    stage: 'send',
+    toAddress, subject,
+    bodyChars: bodyText.length,
+    attachmentsUploaded: uploaded.length,
+    attachments: uploaded.map((u) => ({ name: u.name, sizeBytes: u.sizeBytes, id: u.id })),
+    autoSelected: selection?.best ? { name: selection.best.name, score: selection.best.score } : null,
+    ts: sent.ts || new Date().toISOString(),
+  });
 });
 
 // ---------- per-thread analysis ----------

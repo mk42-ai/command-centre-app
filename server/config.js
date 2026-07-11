@@ -22,7 +22,34 @@ export const CONFIG = {
     sendEndpointId: process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5',
     analysisEndpointId: process.env.ONDEMAND_ANALYSIS_ENDPOINT_ID || 'predefined-claude-sonnet-5',
     agentIds: (process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean),
+    // v31: the Zoho-Mail-capable OnDemand agent used for live inbox fetch + send.
+    // Separated from the generic chat agentIds so the mail path can be pointed
+    // at a mail-tool agent without disturbing the copilot drafting agent.
+    mailAgentIds: (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean),
     embeddingsUrl: process.env.ONDEMAND_EMBEDDINGS_URL || '', // optional remote embedding endpoint
+  },
+
+  // ---- v31: OnDemand file directory (knowledge base) for attachment selection ----
+  // GET {mediaBaseUrl}/public/file lists company media; each row carries
+  // name/url/mimeType/extractedText — used for SEMANTIC document selection and
+  // real binary attachment upload (media/v1/public/file/raw). Verified live.
+  fileDirectory: {
+    mediaBaseUrl: process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-demand.io/media/v1',
+    // v31: list a large window — the directory is newest-first and dominated by
+    // scratch artifacts (png/json), so real business PDFs/DOCX sit deeper.
+    listLimit: num(process.env.FILE_DIR_LIST_LIMIT, 500),
+    lookbackDays: num(process.env.FILE_DIR_LOOKBACK_DAYS, 365),
+  },
+
+  // ---- v31: live mail fetch window + recency contract ----
+  mail: {
+    // Fetch ONLY the last N days, newest-first (task requirement #1).
+    lookbackDays: num(process.env.MAIL_LOOKBACK_DAYS, 7),
+    maxResults: num(process.env.MAIL_MAX_RESULTS, 50),
+    // v31: SHORT cache TTL for inbox fetches (was 7-day summary TTL) so the
+    // dashboard reflects new mail within minutes, not days. Set 0 to bypass.
+    fetchTtlS: num(process.env.MAIL_FETCH_TTL_S, 180), // 3 minutes
+    mailbox: process.env.MAILBOX_ADDRESS || 'mk@airev.ae',
   },
 
   // ---- Zoho Mail API (the user's mail credential is Zoho, NOT Gmail) ----
@@ -41,10 +68,18 @@ export const CONFIG = {
     mailbox: process.env.MAILBOX_ADDRESS || 'mk@airev.ae',
   },
 
-  // ---- mail provider selection: zoho | seed | gmail ----
-  // 'seed' replays the embedded intelligence snapshot (src/data.js) so the
-  // whole pipeline runs deterministically with zero credentials.
-  mailProvider: process.env.MAIL_PROVIDER || '',
+  // ---- mail provider selection: ondemand | zoho | seed ----
+  // v31 (FIX #1): the DEFAULT is now the LIVE OnDemand mail provider — the
+  // static seed fixture is NEVER used unless a human explicitly sets
+  // MAIL_PROVIDER=seed for a local demo. A missing/blocked live credential
+  // surfaces a CLEAR ERROR from the provider rather than silently replaying
+  // the stale 16-thread snapshot (the root cause of "always the same old
+  // emails" in the audit).
+  mailProvider: process.env.MAIL_PROVIDER || 'ondemand',
+  // v31: hard switch — even if someone leaves MAIL_PROVIDER empty, never fall
+  // back to seed data automatically. Set ALLOW_SEED_FALLBACK=1 to re-enable the
+  // old demo behaviour explicitly.
+  allowSeedFallback: /^(1|true|yes|on)$/i.test(String(process.env.ALLOW_SEED_FALLBACK || '')),
 
   // ---- cache ----
   cache: {
@@ -52,8 +87,12 @@ export const CONFIG = {
     // default the persistent KV file there when running serverless.
     dir: process.env.CACHE_DIR || (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME ? '/tmp/.mcc-data' : '.data'),
     defaultTtlS: num(process.env.CACHE_DEFAULT_TTL_S, 6 * 3600),
-    dashboardTtlS: num(process.env.CACHE_DASHBOARD_TTL_S, 20 * 60),
-    summaryTtlS: num(process.env.CACHE_SUMMARY_TTL_S, 7 * 24 * 3600),
+    // v31 (FIX #1): dashboard/summary caches shortened so fresh inbox mail
+    // surfaces within minutes. Dashboard was 20 min → 3 min; per-thread
+    // summary was 7 DAYS → 10 min (the 7-day TTL was a primary staleness
+    // amplifier called out in the audit).
+    dashboardTtlS: num(process.env.CACHE_DASHBOARD_TTL_S, 3 * 60),
+    summaryTtlS: num(process.env.CACHE_SUMMARY_TTL_S, 10 * 60),
     profileTtlS: num(process.env.CACHE_PROFILE_TTL_S, 14 * 24 * 3600),
     embeddingTtlS: num(process.env.CACHE_EMBEDDING_TTL_S, 30 * 24 * 3600),
     maxEntries: num(process.env.CACHE_MAX_ENTRIES, 5000),
@@ -62,7 +101,12 @@ export const CONFIG = {
 
   // ---- semantic cache ----
   semantic: {
-    threshold: Math.min(0.99, Math.max(0.5, num(process.env.SEMANTIC_SIM_THRESHOLD, 0.9))), // 0.85–0.95 recommended
+    // v31 (FIX #1): threshold raised 0.90 → 0.985 so only NEAR-IDENTICAL
+    // prompts reuse a cached answer. At 0.90 two different recent emails
+    // collided and served a stale analysis. Mail-fetch prompts additionally
+    // bypass the semantic cache entirely (see llm.js analyseFresh + a
+    // per-call cache-buster), so recency is never masked.
+    threshold: Math.min(0.999, Math.max(0.5, num(process.env.SEMANTIC_SIM_THRESHOLD, 0.985))),
     dim: num(process.env.EMBEDDING_DIM, 256),
     maxVectors: num(process.env.SEMANTIC_MAX_VECTORS, 2000),
   },

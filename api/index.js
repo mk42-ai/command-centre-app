@@ -10,6 +10,9 @@ import express from 'express';
 import { Readable } from 'node:stream';
 import { api as backendApi } from '../server/routes.js';
 import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs } from '../server/lib/ondemand.js';
+// v30: shared copilot session manager + env reconciliation report
+import { ensureCopilotSession, reinitCopilotSession, copilotSessionStatus } from '../server/lib/session.js';
+import { envReconciliation } from '../server/lib/env.js';
 import { sendMailDirect } from '../server/lib/mail.js';
 import { mergeRecords as wfMergeRecords, pollWorkflowOnce as wfPollOnce, ingestState as wfIngestState, WF_CONFIG } from '../server/lib/workflow-ingest.js';
 
@@ -42,9 +45,14 @@ const MEDIA_BASE_URL = process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-de
 const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'plugin-1713954536').split(',').map((s) => s.trim()).filter(Boolean);
 
 app.get('/api/health', (_req, res) => res.json({
-  ok: true, platform: 'vercel', version: 'v25', keyConfigured: Boolean(API_KEY),
+  ok: true, platform: 'vercel', version: 'v31', keyConfigured: odConfigured(),
+  baseUrl: BASE_URL,                              // v30: /chat/v1-normalized base in effect
   draftEndpointId: DRAFT_ENDPOINT_ID, sendEndpointId: SEND_ENDPOINT_ID,
   mediaBaseUrl: MEDIA_BASE_URL, uploadRoute: true,
+  // v31 fix routes (live mail fetch, semantic doc select, structured send)
+  liveMailRoute: '/api/mail/fetch', docSelectRoute: '/api/documents/select', structuredSendRoute: '/api/send-structured',
+  copilotSession: copilotSessionStatus(),        // v30: warm-session readiness
+  envReconciliation,                              // v30: ON_DEMAND_*→ONDEMAND_* aliases fired
   ts: new Date().toISOString(),
 }));
 
@@ -96,7 +104,8 @@ app.post('/api/query', async (req, res) => {
     let upstream = await streamOnce(String(sessionId));
     if (upstream.status === 404) {
       try {
-        const freshId = await odCreateSession({ contextMetadata: [{ key: 'app', value: 'meera-command-centre' }, { key: 'recovery', value: 'stale-session-404' }] });
+        // v30: re-mint through the shared session manager (lazy re-init on drop)
+        const freshId = await reinitCopilotSession('query-stale-session-404');
         if (freshId) upstream = await streamOnce(String(freshId));
       } catch { /* fall through */ }
     }
