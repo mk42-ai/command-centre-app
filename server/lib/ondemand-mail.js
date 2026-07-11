@@ -94,13 +94,15 @@ async function validateAgentAtQuery(agentId) {
 
 /** Resolve a query-time-healthy mail agent, using a short-TTL cache.
  *  Probes candidates in order (primary first). Throws if none pass. */
-export async function resolveHealthyMailAgent({ force = false } = {}) {
+export async function resolveHealthyMailAgent({ force = false, exclude = [] } = {}) {
   const now = Date.now();
-  if (!force && _healthyAgent.id && (now - _healthyAgent.at) < HEALTHY_AGENT_TTL_MS) {
+  const excluded = new Set(exclude || []);
+  if (!force && _healthyAgent.id && !excluded.has(_healthyAgent.id) && (now - _healthyAgent.at) < HEALTHY_AGENT_TTL_MS) {
     return { agentId: _healthyAgent.id, cached: true, probed: [] };
   }
   const probed = [];
   for (const cand of MAIL_AGENT_CANDIDATES()) {
+    if (excluded.has(cand)) continue; // v33: skip agents that already failed a real send this call
     const ok = await validateAgentAtQuery(cand);
     probed.push({ agentId: cand, healthy: ok });
     if (ok) {
@@ -108,7 +110,7 @@ export async function resolveHealthyMailAgent({ force = false } = {}) {
       return { agentId: cand, cached: false, probed };
     }
   }
-  const err = new Error(`no mail-capable agent passed query-time validation (tried: ${MAIL_AGENT_CANDIDATES().join(', ')})`);
+  const err = new Error(`no mail-capable agent passed query-time validation (tried: ${MAIL_AGENT_CANDIDATES().filter((c) => !excluded.has(c)).join(', ') || '(all excluded)'})`);
   err.code = 'NO_HEALTHY_AGENT'; err.status = 502; err.probed = probed; throw err;
 }
 
@@ -407,15 +409,18 @@ export async function sendViaOnDemandAgent({ toAddress, subject, contentHtml, at
   const t0 = Date.now();
   const MAX_ATTEMPTS = Number(process.env.MAIL_SEND_MAX_ATTEMPTS || 3);
   const attemptsLog = [];
+  const failedAgents = new Set(); // v33: agents whose real send failed → skip on next pick
   let lastResult = null;
   let lastErr = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const nonce = crypto.randomUUID();
-    // (a) pick a query-time-HEALTHY agent (short-TTL cache; force re-probe after a failure)
+    // (a) pick a query-time-HEALTHY agent, EXCLUDING any that already failed a real
+    //     send this call (the non-send health probe can pass for an agent whose Zoho
+    //     tool is ticket-broken, so cross-agent failover must be driven by send outcome).
     let agentId;
     try {
-      const sel = await resolveHealthyMailAgent({ force: attempt > 1 });
+      const sel = await resolveHealthyMailAgent({ force: attempt > 1, exclude: [...failedAgents] });
       agentId = sel.agentId;
       attemptsLog.push({ attempt, agentId, agentCached: sel.cached, probed: sel.probed });
     } catch (e) {
@@ -474,11 +479,19 @@ export async function sendViaOnDemandAgent({ toAddress, subject, contentHtml, at
       });
       lastResult = r;
 
-      // (f) platform-unhealthy signal → invalidate agent + retry with a different one
-      if (!r.ok || isAgentUnhealthy(r)) {
+      // (f) platform-unhealthy signal (invalidAgentIds / INVALID_TICKET, or a
+      //     RESULT: FAILED whose reason is a ticket error) → mark this agent failed,
+      //     invalidate the cache, and FAIL OVER to the next candidate on retry.
+      const failedReason = (() => {
+        const mm = String(r.answer || '').match(/RESULT:\s*FAILED\s*([^\n\r]*)/i);
+        return mm ? mm[1].toLowerCase() : '';
+      })();
+      const ticketFailed = failedReason.includes('invalid_ticket') || failedReason.includes('invalid ticket') || failedReason.includes('authentication');
+      if (!r.ok || isAgentUnhealthy(r) || ticketFailed) {
+        failedAgents.add(agentId);   // v33: exclude this agent from the next pick → cross-agent failover
         invalidateHealthyAgent();
-        attemptsLog[attemptsLog.length - 1].outcome = `unhealthy (status ${r.status})`;
-        logger.warn('mail.send.retry', { attempt, agentId, status: r.status });
+        attemptsLog[attemptsLog.length - 1].outcome = ticketFailed ? `send-failed ticket (${r.status})` : `unhealthy (status ${r.status})`;
+        logger.warn('mail.send.retry', { attempt, agentId, status: r.status, ticketFailed });
         if (attempt < MAX_ATTEMPTS) { await sleep(backoffMs(attempt)); continue; }
       }
 
@@ -513,6 +526,7 @@ export async function sendViaOnDemandAgent({ toAddress, subject, contentHtml, at
       if (attempt < MAX_ATTEMPTS) await sleep(backoffMs(attempt));
     } catch (e) {
       lastErr = e;
+      if (agentId) failedAgents.add(agentId);   // v33: fail over on a hard error too
       attemptsLog.push({ attempt, agentId, error: String(e?.message || e) });
       invalidateHealthyAgent();
       logger.error('mail.send.attempt.error', { attempt, agentId, error: String(e?.message || e) });
