@@ -105,7 +105,7 @@ function throwIfRetryableStatus(resp, label) {
  * Retries transient failures (timeout/network/429/5xx) with backoff.
  * Throws { status, detail } on terminal failure so callers surface real errors.
  */
-export async function createSession({ externalUserId = null, contextMetadata = null } = {}) {
+export async function createSession({ externalUserId = null, contextMetadata = null, agentIds = null } = {}) {
   let attempts = 0;
   const t0 = Date.now();
   try {
@@ -115,7 +115,8 @@ export async function createSession({ externalUserId = null, contextMetadata = n
         method: 'POST',
         headers: { apikey: API_KEY(), 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          agentIds: AGENT_IDS(),
+          // v32: allow a per-call agent binding for mail-agent failover.
+          agentIds: Array.isArray(agentIds) && agentIds.length ? agentIds : AGENT_IDS(),
           externalUserId: String(externalUserId || crypto.randomUUID()),
           contextMetadata: Array.isArray(contextMetadata) ? contextMetadata : [
             { key: 'app', value: 'meera-command-centre' },

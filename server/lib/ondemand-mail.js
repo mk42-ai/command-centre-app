@@ -34,6 +34,87 @@ const MAIL_AGENT_IDS = () =>
 // v32: the endpoint used for BOTH the agent send and the agent fetch queries.
 const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-fable-5';
 
+// ============================================================
+// v33 — mail-agent FAILOVER + retry infrastructure.
+//
+// The OnDemand-brokered Zoho connector behind a mail agent is intermittently
+// unhealthy: session-create may return 201 while the *query* returns HTTP 400
+// `invalidAgentIds`, or the agent runs but its Zoho ticket is expired
+// (`INVALID_TICKET`). To survive this we:
+//   • keep a CANDIDATE list of mail-capable agents (env-overridable),
+//   • VALIDATE each candidate at QUERY time (not just session-create) with a
+//     trivial probe before trusting it for a send,
+//   • CACHE the healthy agent id for a short TTL, and INVALIDATE it the moment
+//     a send hits invalidAgentIds / INVALID_TICKET.
+// ============================================================
+const MAIL_AGENT_CANDIDATES = () => {
+  const primary = MAIL_AGENT_IDS();
+  const extra = (process.env.ONDEMAND_MAIL_AGENT_CANDIDATES || 'agent-1741770626,agent-1722285968')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  // primary first, then any others, de-duplicated, preserving order
+  return [...new Set([...primary, ...extra])];
+};
+const HEALTHY_AGENT_TTL_MS = Number(process.env.MAIL_AGENT_HEALTH_TTL_MS || 120000); // 2 min
+let _healthyAgent = { id: null, at: 0 };
+
+/** Recognise the platform-side "agent/ticket unhealthy" signals in a query result. */
+export function isAgentUnhealthy(r) {
+  if (!r) return false;
+  if (r.status === 400 || r.status === 401 || r.status === 403) {
+    const blob = JSON.stringify(r.raw || {}).toLowerCase();
+    if (blob.includes('invalidagentids') || blob.includes('invalid_ticket') || blob.includes('invalid ticket')) return true;
+  }
+  const ans = String(r.answer || '').toLowerCase();
+  return ans.includes('invalid_ticket') || ans.includes('invalid ticket');
+}
+
+/** Query-time validation of ONE candidate agent on a throwaway session.
+ *  Returns true only if the agent both creates a session AND answers a query
+ *  (i.e. it is bound and its connector responds) with no unhealthy signal. */
+async function validateAgentAtQuery(agentId) {
+  try {
+    const sid = await createSession({
+      externalUserId: `mcc-agentprobe-${Date.now()}-${crypto.randomUUID().slice(0, 6)}`,
+      agentIds: [agentId],
+      contextMetadata: [{ key: 'app', value: 'meera-command-centre' }, { key: 'purpose', value: 'agent-health-probe' }],
+    });
+    const r = await querySync(sid, 'HEALTHCHECK: reply with the two words AGENT READY and nothing else.', {
+      endpointId: SEND_ENDPOINT_ID(), agentIds: [agentId], temperature: 0, timeoutMs: 45000, retries: 0,
+    });
+    if (!r.ok || isAgentUnhealthy(r)) {
+      logger.warn('mail.agent.probe.unhealthy', { agentId, status: r.status });
+      return false;
+    }
+    return true;
+  } catch (e) {
+    logger.warn('mail.agent.probe.error', { agentId, error: String(e?.message || e) });
+    return false;
+  }
+}
+
+/** Resolve a query-time-healthy mail agent, using a short-TTL cache.
+ *  Probes candidates in order (primary first). Throws if none pass. */
+export async function resolveHealthyMailAgent({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && _healthyAgent.id && (now - _healthyAgent.at) < HEALTHY_AGENT_TTL_MS) {
+    return { agentId: _healthyAgent.id, cached: true, probed: [] };
+  }
+  const probed = [];
+  for (const cand of MAIL_AGENT_CANDIDATES()) {
+    const ok = await validateAgentAtQuery(cand);
+    probed.push({ agentId: cand, healthy: ok });
+    if (ok) {
+      _healthyAgent = { id: cand, at: Date.now() };
+      return { agentId: cand, cached: false, probed };
+    }
+  }
+  const err = new Error(`no mail-capable agent passed query-time validation (tried: ${MAIL_AGENT_CANDIDATES().join(', ')})`);
+  err.code = 'NO_HEALTHY_AGENT'; err.status = 502; err.probed = probed; throw err;
+}
+
+/** Invalidate the cached healthy agent (call on a send that hits invalidAgentIds/INVALID_TICKET). */
+export function invalidateHealthyAgent() { _healthyAgent = { id: null, at: 0 }; }
+
 export function mailConfigured() { return Boolean(API_KEY()); }
 
 /** ISO date N days before now (UTC). */
@@ -77,9 +158,17 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
   const nonce = crypto.randomUUID();
   const t0 = Date.now();
 
+  // v33: pick a query-time-healthy mail agent (short-TTL cache). If none pass
+  // the probe, fall back to the primary agent so fetch still attempts live and
+  // fails loudly (never seed) rather than short-circuiting.
+  let fetchAgentIds = MAIL_AGENT_IDS();
+  try { fetchAgentIds = [(await resolveHealthyMailAgent()).agentId]; }
+  catch (e) { logger.warn('mail.fetch.agent.fallback', { error: String(e?.message || e) }); }
+
   // FRESH session per fetch (cache-buster in externalUserId + contextMetadata)
   const sessionId = await createSession({
     externalUserId: `mcc-mailfetch-${Date.now()}-${nonce.slice(0, 8)}`,
+    agentIds: fetchAgentIds,
     contextMetadata: [
       { key: 'app', value: 'meera-command-centre' },
       { key: 'purpose', value: 'live-inbox-fetch' },
@@ -106,9 +195,9 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
   try {
     r = await querySync(sessionId, prompt, {
       // route to the mail-capable agent explicitly (see querySync agentIds override)
-      // v32: same Zoho mail agent + Fable endpoint the send path uses.
+      // v32/v33: same healthy Zoho mail agent + Fable endpoint the send path uses.
       endpointId: SEND_ENDPOINT_ID(),
-      agentIds: MAIL_AGENT_IDS(),
+      agentIds: fetchAgentIds,
       temperature: 0,
       timeoutMs: 90000,
       retries: 1,
@@ -315,81 +404,144 @@ export async function sendViaOnDemandAgent({ toAddress, subject, contentHtml, at
   const to = String(toAddress || '').trim();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) { const e = new Error(`refusing to send: toAddress "${toAddress}" is not a valid email`); e.code = 'INVALID_RECIPIENT'; e.status = 400; throw e; }
 
-  const nonce = crypto.randomUUID();
   const t0 = Date.now();
+  const MAX_ATTEMPTS = Number(process.env.MAIL_SEND_MAX_ATTEMPTS || 3);
+  const attemptsLog = [];
+  let lastResult = null;
+  let lastErr = null;
 
-  // 1. fresh session bound to the mail agent
-  const sessionId = await createSession({
-    externalUserId: `mcc-send-${Date.now()}-${nonce.slice(0, 8)}`,
-    contextMetadata: [
-      { key: 'app', value: 'meera-command-centre' },
-      { key: 'purpose', value: 'structured-send' },
-      { key: 'nonce', value: nonce },
-    ],
-  });
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const nonce = crypto.randomUUID();
+    // (a) pick a query-time-HEALTHY agent (short-TTL cache; force re-probe after a failure)
+    let agentId;
+    try {
+      const sel = await resolveHealthyMailAgent({ force: attempt > 1 });
+      agentId = sel.agentId;
+      attemptsLog.push({ attempt, agentId, agentCached: sel.cached, probed: sel.probed });
+    } catch (e) {
+      lastErr = e;
+      attemptsLog.push({ attempt, error: String(e?.message || e), probed: e?.probed || [] });
+      // no healthy agent this round — brief backoff then retry the probe
+      if (attempt < MAX_ATTEMPTS) { await sleep(backoffMs(attempt)); continue; }
+      break;
+    }
 
-  // 2. upload attachments bound to THIS session (per reference pattern)
-  const uploaded = [];
-  for (const a of (attachments || [])) {
-    if (!a?.url || !a?.name) continue;
-    const up = await uploadAttachmentFromUrl({ url: a.url, name: a.name, sessionId });
-    uploaded.push(up);
+    try {
+      // (b) FRESH session bound to the chosen agent
+      const sessionId = await createSession({
+        externalUserId: `mcc-send-${Date.now()}-${nonce.slice(0, 8)}`,
+        agentIds: [agentId],
+        contextMetadata: [
+          { key: 'app', value: 'meera-command-centre' },
+          { key: 'purpose', value: 'structured-send' },
+          { key: 'nonce', value: nonce },
+        ],
+      });
+
+      // (c) upload attachments bound to THIS fresh session (re-uploaded each retry)
+      const uploaded = [];
+      for (const a of (attachments || [])) {
+        if (!a?.url || !a?.name) continue;
+        const up = await uploadAttachmentFromUrl({ url: a.url, name: a.name, sessionId });
+        uploaded.push(up);
+      }
+
+      // (d) strong, imperative send prompt referencing the uploaded media
+      const attachBlock = uploaded.length
+        ? `\nATTACHMENTS — the following file(s) are ALREADY UPLOADED to the OnDemand media store for THIS session. You MUST attach each as a real binary file on the outgoing email (do NOT paste links in the body):\n` +
+          uploaded.map((u) => `- name: ${u.name} | mediaId: ${u.id}${u.url ? ` | url: ${u.url}` : ''}`).join('\n') + `\n`
+        : '';
+      const prompt =
+        `You are the Zoho Mail sending agent. IMPERATIVE: send ONE email RIGHT NOW using your Zoho Mail send tool. Do not ask for confirmation; do not describe what you would do — actually invoke the tool.\n` +
+        `REQUEST ID: ${nonce}\n` +
+        `TO (recipient): ${to}\n` +
+        `SUBJECT: ${subject}\n` +
+        `BODY: send the following complete, well-formed HTML VERBATIM as the message body — do not summarise, truncate, or rewrite it:\n` +
+        `--- BEGIN HTML BODY ---\n${html}\n--- END HTML BODY ---\n` +
+        attachBlock +
+        `\nAfter the tool call returns, reply with the FIRST line of your response in EXACTLY this machine-readable format and NOTHING else on that line:\n` +
+        `RESULT: SENT <the Zoho message id>      (only if the Zoho tool confirmed the email was dispatched)\n` +
+        `RESULT: FAILED <short reason>           (if the send did not succeed for any reason)\n` +
+        `Do not print RESULT: SENT unless the Zoho tool actually returned success. After that first line you may add details.`;
+
+      // (e) submit the send query on the chosen agent
+      const r = await querySync(sessionId, prompt, {
+        endpointId: SEND_ENDPOINT_ID(),
+        agentIds: [agentId],
+        temperature: 0.7,
+        timeoutMs: 120000,
+        retries: 0,
+      });
+      lastResult = r;
+
+      // (f) platform-unhealthy signal → invalidate agent + retry with a different one
+      if (!r.ok || isAgentUnhealthy(r)) {
+        invalidateHealthyAgent();
+        attemptsLog[attemptsLog.length - 1].outcome = `unhealthy (status ${r.status})`;
+        logger.warn('mail.send.retry', { attempt, agentId, status: r.status });
+        if (attempt < MAX_ATTEMPTS) { await sleep(backoffMs(attempt)); continue; }
+      }
+
+      const answer = String(r.answer || '');
+      const m = answer.match(/RESULT:\s*(SENT|FAILED)\s*([^\n\r]*)/i);
+      const resultToken = m ? m[1].toUpperCase() : null;
+      const resultLine = m ? `RESULT: ${resultToken}${m[2] ? ' ' + m[2].trim() : ''}` : null;
+      const ok = r.ok && resultToken === 'SENT';
+      const midMatch = (m && m[2] && m[2].match(/[<A-Za-z0-9._@-]{6,}/)) || answer.match(/<[^>@\s]+@[^>\s]+>|\b\d{15,}\b/);
+      const messageId = ok && midMatch ? String(midMatch[0]).trim() : null;
+
+      // A clean SENT, or an honest FAILED from a healthy agent → return (no more retries).
+      // Only keep retrying while the failure was a platform-unhealthy signal (handled above).
+      if (ok || (resultToken === 'FAILED' && !isAgentUnhealthy(r)) || attempt === MAX_ATTEMPTS) {
+        attemptsLog[attemptsLog.length - 1].outcome = resultLine || `no RESULT line (status ${r.status})`;
+        logger.info('mail.send.result', { ms: Date.now() - t0, ok, resultToken, agentId, attempt, attachmentsUploaded: uploaded.length });
+        return {
+          ok,
+          provider: 'ondemand-agent',
+          endpointId: SEND_ENDPOINT_ID(),
+          agentId, agentIds: [agentId],
+          sessionId,
+          toAddress: to, subject,
+          resultToken, resultLine, messageId,
+          answerExcerpt: answer.slice(0, 500),
+          attachments: uploaded.map((u) => ({ name: u.name, mediaId: u.id, url: u.url, sizeBytes: u.sizeBytes })),
+          attempts: attemptsLog, attemptCount: attempt,
+          httpStatus: r.status,
+          ts: new Date().toISOString(),
+        };
+      }
+      if (attempt < MAX_ATTEMPTS) await sleep(backoffMs(attempt));
+    } catch (e) {
+      lastErr = e;
+      attemptsLog.push({ attempt, agentId, error: String(e?.message || e) });
+      invalidateHealthyAgent();
+      logger.error('mail.send.attempt.error', { attempt, agentId, error: String(e?.message || e) });
+      if (attempt < MAX_ATTEMPTS) await sleep(backoffMs(attempt));
+    }
   }
 
-  // 3. build the send instruction; reference the uploaded media so the agent attaches it
-  const attachBlock = uploaded.length
-    ? `\nATTACHMENTS (already uploaded to the OnDemand media store for THIS session — attach each as a real binary file on the outgoing email):\n` +
-      uploaded.map((u) => `- name: ${u.name} | mediaId: ${u.id}${u.url ? ` | url: ${u.url}` : ''}`).join('\n') + `\n`
-    : '';
-  const prompt =
-    `TASK (request id ${nonce}): send ONE email via your Zoho Mail tool NOW.\n` +
-    `RECIPIENT (To): ${to}\n` +
-    `SUBJECT: ${subject}\n` +
-    `EMAIL BODY — send this HTML VERBATIM as the message body (it is complete, well-formed HTML; do not summarise, truncate, or rewrite it):\n` +
-    `--- BEGIN HTML BODY ---\n${html}\n--- END HTML BODY ---\n` +
-    attachBlock +
-    `\nExecute the send now. Then report the outcome with the FIRST line of your reply in EXACTLY this machine-readable format and nothing else on that line:\n` +
-    `"RESULT: SENT <message-id>"  (if the email was dispatched)  OR  "RESULT: FAILED <short reason>"  (if it was not). After that first line you may add details.`;
-
-  let r;
-  try {
-    r = await querySync(sessionId, prompt, {
-      endpointId: SEND_ENDPOINT_ID(),
-      agentIds: MAIL_AGENT_IDS(),
-      temperature: 0.7,
-      timeoutMs: 120000,
-      retries: 1,
-    });
-  } catch (e) {
-    logger.error('mail.send.error', { ms: Date.now() - t0, error: String(e?.message || e) });
-    const err = new Error(`OnDemand agent send failed: ${String(e?.message || e)}`);
-    err.code = 'SEND_FAILED'; err.status = 502; throw err;
-  }
-
-  const answer = String(r.answer || '');
+  // All attempts exhausted → honest structured failure (NEVER a false success).
+  const answer = String(lastResult?.answer || '');
   const m = answer.match(/RESULT:\s*(SENT|FAILED)\s*([^\n\r]*)/i);
-  const resultToken = m ? m[1].toUpperCase() : null;
-  const resultLine = m ? `RESULT: ${resultToken}${m[2] ? ' ' + m[2].trim() : ''}` : null;
-  const ok = r.ok && resultToken === 'SENT';
-  // extract a plausible message id from the RESULT line or the body
-  const midMatch = (m && m[2] && m[2].match(/[<A-Za-z0-9._@-]{6,}/)) || answer.match(/<[^>@\s]+@[^>\s]+>|\b\d{15,}\b/);
-  const messageId = ok && midMatch ? String(midMatch[0]).trim() : null;
-
-  logger.info('mail.send.result', { ms: Date.now() - t0, ok, resultToken, sessionId, attachmentsUploaded: uploaded.length });
+  const reason = m ? m[0].trim()
+    : (lastErr ? String(lastErr.message || lastErr) : `agent send did not succeed after ${MAX_ATTEMPTS} attempts`);
+  logger.error('mail.send.exhausted', { ms: Date.now() - t0, attempts: attemptsLog.length });
   return {
-    ok,
+    ok: false,
     provider: 'ondemand-agent',
     endpointId: SEND_ENDPOINT_ID(),
-    agentIds: MAIL_AGENT_IDS(),
-    sessionId,
-    toAddress: to,
-    subject,
-    resultToken,        // 'SENT' | 'FAILED' | null
-    resultLine,         // the verbatim machine-readable first line
-    messageId,          // parsed message id when SENT
+    toAddress: to, subject,
+    resultToken: 'FAILED',
+    resultLine: `RESULT: FAILED ${reason}`,
+    messageId: null,
+    error: reason,
     answerExcerpt: answer.slice(0, 500),
-    attachments: uploaded.map((u) => ({ name: u.name, mediaId: u.id, url: u.url, sizeBytes: u.sizeBytes })),
-    httpStatus: r.status,
+    attempts: attemptsLog, attemptCount: attemptsLog.length,
+    httpStatus: lastResult?.status || (lastErr?.status ?? 502),
     ts: new Date().toISOString(),
   };
 }
+
+// small helpers for the retry loop
+function sleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
+function backoffMs(attempt) { return Math.min(8000, 1000 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 300); }
