@@ -31,6 +31,8 @@ const MEDIA_BASE = () => (process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on
 const MAIL_AGENT_IDS = () =>
   (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626')
     .split(',').map((s) => s.trim()).filter(Boolean);
+// v32: the endpoint used for BOTH the agent send and the agent fetch queries.
+const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-fable-5';
 
 export function mailConfigured() { return Boolean(API_KEY()); }
 
@@ -104,6 +106,8 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
   try {
     r = await querySync(sessionId, prompt, {
       // route to the mail-capable agent explicitly (see querySync agentIds override)
+      // v32: same Zoho mail agent + Fable endpoint the send path uses.
+      endpointId: SEND_ENDPOINT_ID(),
       agentIds: MAIL_AGENT_IDS(),
       temperature: 0,
       timeoutMs: 90000,
@@ -285,4 +289,107 @@ export async function uploadAttachmentFromUrl({ url, name, sessionId = null }) {
   const d = j.data;
   logger.info('mail.attach.upload', { name, sizeBytes: buf.length, id: d.id });
   return { ok: true, id: d.id, mediaId: d.id, url: d.url || d.sourceUrl || null, name, sizeBytes: buf.length, contentType };
+}
+
+// ------------------------------------------------------------
+// v32 — sendViaOnDemandAgent(): route the send THROUGH the OnDemand Zoho
+// mail agent (agent-1741770626), exactly per the reference script pattern.
+//   1. create a FRESH session (agentIds:[MAIL_AGENT], externalUserId:uuid).
+//   2. upload each attachment binary to media/v1/public/file/raw BOUND to that
+//      fresh sessionId (so the agent can attach it), collecting media IDs/URLs.
+//   3. POST a sync query on predefined-claude-fable-5 whose prompt carries the
+//      recipient, subject, full HTML body, and the uploaded media references,
+//      and demands a machine-readable first line "RESULT: SENT <id>" /
+//      "RESULT: FAILED <reason>".
+// No ZOHO_* credentials are used or required — the agent owns the mail
+// credential. Returns a structured result incl. the raw RESULT line, parsed
+// status, message id, and the uploaded media descriptors.
+// ------------------------------------------------------------
+export async function sendViaOnDemandAgent({ toAddress, subject, contentHtml, attachments = [] }) {
+  if (!mailConfigured()) {
+    const e = new Error('ONDEMAND_API_KEY missing — cannot send via OnDemand agent.');
+    e.code = 'SEND_NOT_CONFIGURED'; e.status = 503; throw e;
+  }
+  const html = String(contentHtml || '').trim();
+  if (!html) { const e = new Error('refusing to send: email body (contentHtml) is empty'); e.code = 'EMPTY_BODY'; e.status = 400; throw e; }
+  const to = String(toAddress || '').trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) { const e = new Error(`refusing to send: toAddress "${toAddress}" is not a valid email`); e.code = 'INVALID_RECIPIENT'; e.status = 400; throw e; }
+
+  const nonce = crypto.randomUUID();
+  const t0 = Date.now();
+
+  // 1. fresh session bound to the mail agent
+  const sessionId = await createSession({
+    externalUserId: `mcc-send-${Date.now()}-${nonce.slice(0, 8)}`,
+    contextMetadata: [
+      { key: 'app', value: 'meera-command-centre' },
+      { key: 'purpose', value: 'structured-send' },
+      { key: 'nonce', value: nonce },
+    ],
+  });
+
+  // 2. upload attachments bound to THIS session (per reference pattern)
+  const uploaded = [];
+  for (const a of (attachments || [])) {
+    if (!a?.url || !a?.name) continue;
+    const up = await uploadAttachmentFromUrl({ url: a.url, name: a.name, sessionId });
+    uploaded.push(up);
+  }
+
+  // 3. build the send instruction; reference the uploaded media so the agent attaches it
+  const attachBlock = uploaded.length
+    ? `\nATTACHMENTS (already uploaded to the OnDemand media store for THIS session — attach each as a real binary file on the outgoing email):\n` +
+      uploaded.map((u) => `- name: ${u.name} | mediaId: ${u.id}${u.url ? ` | url: ${u.url}` : ''}`).join('\n') + `\n`
+    : '';
+  const prompt =
+    `TASK (request id ${nonce}): send ONE email via your Zoho Mail tool NOW.\n` +
+    `RECIPIENT (To): ${to}\n` +
+    `SUBJECT: ${subject}\n` +
+    `EMAIL BODY — send this HTML VERBATIM as the message body (it is complete, well-formed HTML; do not summarise, truncate, or rewrite it):\n` +
+    `--- BEGIN HTML BODY ---\n${html}\n--- END HTML BODY ---\n` +
+    attachBlock +
+    `\nExecute the send now. Then report the outcome with the FIRST line of your reply in EXACTLY this machine-readable format and nothing else on that line:\n` +
+    `"RESULT: SENT <message-id>"  (if the email was dispatched)  OR  "RESULT: FAILED <short reason>"  (if it was not). After that first line you may add details.`;
+
+  let r;
+  try {
+    r = await querySync(sessionId, prompt, {
+      endpointId: SEND_ENDPOINT_ID(),
+      agentIds: MAIL_AGENT_IDS(),
+      temperature: 0.7,
+      timeoutMs: 120000,
+      retries: 1,
+    });
+  } catch (e) {
+    logger.error('mail.send.error', { ms: Date.now() - t0, error: String(e?.message || e) });
+    const err = new Error(`OnDemand agent send failed: ${String(e?.message || e)}`);
+    err.code = 'SEND_FAILED'; err.status = 502; throw err;
+  }
+
+  const answer = String(r.answer || '');
+  const m = answer.match(/RESULT:\s*(SENT|FAILED)\s*([^\n\r]*)/i);
+  const resultToken = m ? m[1].toUpperCase() : null;
+  const resultLine = m ? `RESULT: ${resultToken}${m[2] ? ' ' + m[2].trim() : ''}` : null;
+  const ok = r.ok && resultToken === 'SENT';
+  // extract a plausible message id from the RESULT line or the body
+  const midMatch = (m && m[2] && m[2].match(/[<A-Za-z0-9._@-]{6,}/)) || answer.match(/<[^>@\s]+@[^>\s]+>|\b\d{15,}\b/);
+  const messageId = ok && midMatch ? String(midMatch[0]).trim() : null;
+
+  logger.info('mail.send.result', { ms: Date.now() - t0, ok, resultToken, sessionId, attachmentsUploaded: uploaded.length });
+  return {
+    ok,
+    provider: 'ondemand-agent',
+    endpointId: SEND_ENDPOINT_ID(),
+    agentIds: MAIL_AGENT_IDS(),
+    sessionId,
+    toAddress: to,
+    subject,
+    resultToken,        // 'SENT' | 'FAILED' | null
+    resultLine,         // the verbatim machine-readable first line
+    messageId,          // parsed message id when SENT
+    answerExcerpt: answer.slice(0, 500),
+    attachments: uploaded.map((u) => ({ name: u.name, mediaId: u.id, url: u.url, sizeBytes: u.sizeBytes })),
+    httpStatus: r.status,
+    ts: new Date().toISOString(),
+  };
 }

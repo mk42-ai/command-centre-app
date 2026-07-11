@@ -25,8 +25,8 @@ import {
   generateDailyBriefing, refreshCache, profileSender, semanticSearch, analyzeThread,
 } from './functions/pipeline.js';
 // v31: live mail + file-directory orchestration (fixes #1 fetch, #2 send, #3 attach)
-import { fetchRecentMail, listCompanyFiles, selectRelevantDocument, uploadAttachmentFromUrl, mailConfigured } from './lib/ondemand-mail.js';
-import { sendMailDirect, buildStructuredEmailHtml } from './lib/mail.js';
+import { fetchRecentMail, listCompanyFiles, selectRelevantDocument, sendViaOnDemandAgent } from './lib/ondemand-mail.js';
+import { buildStructuredEmailHtml } from './lib/mail.js';
 
 export const api = Router();
 
@@ -135,27 +135,26 @@ api.post('/send-structured', async (req, res) => {
     });
   }
 
-  // 3. Upload each attachment as a REAL binary file (not prompt text).
-  const uploaded = [];
+  // 3. v32: dispatch THROUGH the OnDemand Zoho mail agent (agent-1741770626).
+  //    The agent owns the mail credential — no ZOHO_* vars, no zoho-not-configured
+  //    block. sendViaOnDemandAgent() opens a fresh session, uploads each
+  //    attachment as a REAL binary bound to that session (media/v1/public/file/raw),
+  //    references the uploaded media in the send query, and returns the agent's
+  //    machine-readable "RESULT: SENT/FAILED" first line.
+  const contentHtml = buildStructuredEmailHtml({ body: bodyText, attachments: attachmentsIn });
+  let sent;
   try {
-    for (const a of attachmentsIn) {
-      if (!a?.url || !a?.name) continue;
-      const up = await uploadAttachmentFromUrl({ url: a.url, name: a.name });
-      uploaded.push({ name: up.name, url: up.url, id: up.id, sizeBytes: up.sizeBytes });
-    }
+    sent = await sendViaOnDemandAgent({ toAddress, subject, contentHtml, attachments: attachmentsIn });
   } catch (e) {
-    return res.status(e?.status || 502).json({ ok: false, stage: 'attachment-upload', error: String(e?.message || e) });
+    return res.status(e?.status || 502).json({ ok: false, stage: 'send', error: String(e?.message || e), ts: new Date().toISOString() });
   }
-  const contentHtml = buildStructuredEmailHtml({ body: bodyText, attachments: uploaded });
-  const sent = await sendMailDirect({ toAddress, subject, content: bodyText, contentHtml, attachments: uploaded });
-  const httpCode = sent.ok ? 200 : (sent.reason === 'zoho-not-configured' ? 502 : 400);
+  const httpCode = sent.ok ? 200 : 502;
   return res.status(httpCode).json({
     ...sent,
     stage: 'send',
     toAddress, subject,
     bodyChars: bodyText.length,
-    attachmentsUploaded: uploaded.length,
-    attachments: uploaded.map((u) => ({ name: u.name, sizeBytes: u.sizeBytes, id: u.id })),
+    attachmentsUploaded: (sent.attachments || []).length,
     autoSelected: selection?.best ? { name: selection.best.name, score: selection.best.score } : null,
     ts: sent.ts || new Date().toISOString(),
   });
