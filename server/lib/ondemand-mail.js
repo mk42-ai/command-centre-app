@@ -56,6 +56,13 @@ const MAIL_AGENT_CANDIDATES = () => {
 };
 const HEALTHY_AGENT_TTL_MS = Number(process.env.MAIL_AGENT_HEALTH_TTL_MS || 120000); // 2 min
 let _healthyAgent = { id: null, at: 0 };
+// v34: remember the last SUCCESSFUL live inbox sync so the route reports a
+// lastSuccessfulSyncTimestamp instead of silently serving stale cached mail.
+let _lastSuccessfulSync = { at: null, count: 0, agentId: null };
+export function lastSuccessfulSync() { return { ..._lastSuccessfulSync }; }
+// small retry helpers (shared by fetch + send loops)
+function _sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function _backoffMs(attempt) { return Math.min(8000, 1000 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 300); }
 
 /** Recognise the platform-side "agent/ticket unhealthy" signals in a query result. */
 export function isAgentUnhealthy(r) {
@@ -156,104 +163,131 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
   const limit = maxResults ?? CONFIG.mail.maxResults;
   const box = mailbox || CONFIG.mail.mailbox;
   const nowIso = new Date().toISOString();
+  const todayIso = nowIso.slice(0, 10);
   const sinceIso = daysAgoIso(days);
-  const nonce = crypto.randomUUID();
-  const t0 = Date.now();
-
-  // v33: pick a query-time-healthy mail agent (short-TTL cache). If none pass
-  // the probe, fall back to the primary agent so fetch still attempts live and
-  // fails loudly (never seed) rather than short-circuiting.
-  let fetchAgentIds = MAIL_AGENT_IDS();
-  try { fetchAgentIds = [(await resolveHealthyMailAgent()).agentId]; }
-  catch (e) { logger.warn('mail.fetch.agent.fallback', { error: String(e?.message || e) }); }
-
-  // FRESH session per fetch (cache-buster in externalUserId + contextMetadata)
-  const sessionId = await createSession({
-    externalUserId: `mcc-mailfetch-${Date.now()}-${nonce.slice(0, 8)}`,
-    agentIds: fetchAgentIds,
-    contextMetadata: [
-      { key: 'app', value: 'meera-command-centre' },
-      { key: 'purpose', value: 'live-inbox-fetch' },
-      { key: 'nonce', value: nonce },
-      { key: 'asOf', value: nowIso },
-    ],
-  });
-
-  const prompt =
-    `LIVE INBOX FETCH (request id ${nonce}, as of ${nowIso}).\n` +
-    `Use your Zoho Mail tool to read the CURRENT inbox for mailbox ${box}.\n` +
-    `STRICT RECENCY FILTER: return ONLY emails RECEIVED within the last ${days} days ` +
-    `(i.e. on or after ${sinceIso}). Do NOT include anything older. Do NOT use cached ` +
-    `or remembered results from any earlier request — fetch fresh every time.\n` +
-    `SORT: newest first (most recent receivedTime at the top).\n` +
-    `LIMIT: at most ${limit} emails.\n` +
-    `For EACH email return: sender (name + email), subject, date (ISO 8601 receivedTime), ` +
-    `and the FULL plain-text body (not a summary).\n` +
-    `OUTPUT (STRICT): ONLY a JSON array; each element exactly ` +
-    `{"sender":"Name <email>","email":"email","subject":"...","date":"ISO-8601","body":"full text"}. ` +
-    `No markdown, no commentary. If the inbox tool is unavailable or returns nothing, output exactly [].`;
-
-  let r;
-  try {
-    r = await querySync(sessionId, prompt, {
-      // route to the mail-capable agent explicitly (see querySync agentIds override)
-      // v32/v33: same healthy Zoho mail agent + Fable endpoint the send path uses.
-      endpointId: SEND_ENDPOINT_ID(),
-      agentIds: fetchAgentIds,
-      temperature: 0,
-      timeoutMs: 90000,
-      retries: 1,
-    });
-  } catch (e) {
-    logger.error('mail.fetch.error', { ms: Date.now() - t0, error: String(e?.message || e) });
-    const err = new Error(`OnDemand live mail fetch failed: ${String(e?.message || e)}`);
-    err.code = 'MAIL_FETCH_FAILED'; err.status = 502; err.cause = e; throw err;
-  }
-
-  if (!r.ok) {
-    const detail = JSON.stringify(r.raw || {}).slice(0, 300);
-    const err = new Error(`OnDemand live mail fetch returned HTTP ${r.status}: ${detail}`);
-    err.code = 'MAIL_FETCH_UPSTREAM'; err.status = r.status >= 400 ? r.status : 502; throw err;
-  }
-
-  const parsed = parseJsonIsland(r.answer);
-  if (!Array.isArray(parsed)) {
-    const err = new Error(`OnDemand mail agent did not return a JSON array (got: ${String(r.answer).slice(0, 200)}). Live mail credential/agent may be unavailable — NOT falling back to seed data.`);
-    err.code = 'MAIL_FETCH_UNPARSEABLE'; err.status = 502; err.rawAnswer = String(r.answer).slice(0, 500); throw err;
-  }
-
-  // Normalise + enforce recency + newest-first ordering server-side (defence in depth).
   const cutoff = Date.parse(sinceIso);
-  const emails = parsed
-    .map((m, i) => {
-      const dateMs = Date.parse(m.date || m.receivedTime || m.receivedTimeInGMT || '') || null;
-      return {
-        id: String(m.id || m.messageId || `od-${nonce}-${i}`),
-        sender: String(m.sender || m.from || m.fromAddress || 'unknown'),
-        email: String(m.email || m.fromEmail || '').toLowerCase() || null,
-        subject: String(m.subject || '(no subject)'),
-        date: m.date || (dateMs ? new Date(dateMs).toISOString() : null),
-        dateMs,
-        body: String(m.body || m.content || m.snippet || ''),
-      };
-    })
-    .filter((m) => m.dateMs == null || m.dateMs >= cutoff) // keep only last-N-days (unknown-date kept, flagged)
-    .sort((a, b) => (b.dateMs || 0) - (a.dateMs || 0))     // newest first
-    .slice(0, limit);
+  const t0 = Date.now();
+  const MAX_ATTEMPTS = Number(process.env.MAIL_FETCH_MAX_ATTEMPTS || 3);
+  const failedAgents = new Set(); // v34: cross-agent failover, same as the send loop
+  const attemptsLog = [];
+  let lastErr = null;
 
-  logger.info('mail.fetch.ok', { ms: Date.now() - t0, returned: emails.length, days, sessionId });
-  return {
-    ok: true,
-    provider: 'ondemand-live',
-    mailbox: box,
-    lookbackDays: days,
-    since: sinceIso,
-    asOf: nowIso,
-    nonce,
-    count: emails.length,
-    emails,
-    sessionId,
-  };
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const nonce = crypto.randomUUID();
+    // (a) query-time-HEALTHY agent, EXCLUDING any that already failed this call;
+    //     force a re-probe after attempt 1 so a flapping agent is not re-served from cache.
+    let agentId;
+    try {
+      const sel = await resolveHealthyMailAgent({ force: attempt > 1, exclude: [...failedAgents] });
+      agentId = sel.agentId;
+    } catch (e) {
+      lastErr = e; attemptsLog.push({ attempt, error: String(e?.message || e), probed: e?.probed || [] });
+      if (attempt < MAX_ATTEMPTS) { await _sleep(_backoffMs(attempt)); continue; }
+      break;
+    }
+
+    try {
+      // (b) FRESH session per attempt (cache-buster), bound to the chosen agent
+      const sessionId = await createSession({
+        externalUserId: `mcc-mailfetch-${Date.now()}-${nonce.slice(0, 8)}`,
+        agentIds: [agentId],
+        contextMetadata: [
+          { key: 'app', value: 'meera-command-centre' },
+          { key: 'purpose', value: 'live-inbox-fetch' },
+          { key: 'nonce', value: nonce },
+          { key: 'asOf', value: nowIso },
+        ],
+      });
+
+      // (c) recency directive: today = <date>, weight most recent (P5)
+      const prompt =
+        `LIVE INBOX FETCH (request id ${nonce}, as of ${nowIso}).\n` +
+        `CONTEXT: today = ${todayIso}. Weight the MOST RECENT messages; ignore anything older than the window below.\n` +
+        `Use your Zoho Mail tool to read the CURRENT inbox for mailbox ${box}.\n` +
+        `STRICT RECENCY FILTER: return ONLY emails RECEIVED within the last ${days} days ` +
+        `(i.e. on or after ${sinceIso}). Do NOT include anything older. Do NOT use cached ` +
+        `or remembered results from any earlier request — fetch fresh every time.\n` +
+        `SORT: newest first (most recent receivedTime at the top).\n` +
+        `LIMIT: at most ${limit} emails.\n` +
+        `For EACH email return: sender (name + email), subject, date (ISO 8601 receivedTime), ` +
+        `and the FULL plain-text body (not a summary).\n` +
+        `OUTPUT (STRICT): ONLY a JSON array; each element exactly ` +
+        `{"sender":"Name <email>","email":"email","subject":"...","date":"ISO-8601","body":"full text"}. ` +
+        `No markdown, no commentary. If the inbox tool is unavailable or returns nothing, output exactly [].`;
+
+      const r = await querySync(sessionId, prompt, {
+        endpointId: SEND_ENDPOINT_ID(),
+        agentIds: [agentId],
+        temperature: 0,
+        timeoutMs: 90000,
+        retries: 0, // outer loop owns retries so we can fail over across agents
+      });
+
+      // (d) upstream 500 / unhealthy agent → exclude + fail over on next attempt
+      if (!r.ok || isAgentUnhealthy(r)) {
+        failedAgents.add(agentId); invalidateHealthyAgent();
+        attemptsLog.push({ attempt, agentId, outcome: `upstream ${r.status}` });
+        lastErr = Object.assign(new Error(`OnDemand mail fetch upstream HTTP ${r.status}: ${JSON.stringify(r.raw || {}).slice(0, 160)}`), { code: 'MAIL_FETCH_UPSTREAM', status: r.status >= 400 ? r.status : 502 });
+        logger.warn('mail.fetch.retry', { attempt, agentId, status: r.status });
+        if (attempt < MAX_ATTEMPTS) { await _sleep(_backoffMs(attempt)); continue; }
+        break;
+      }
+
+      const parsed = parseJsonIsland(r.answer);
+      if (!Array.isArray(parsed)) {
+        failedAgents.add(agentId); invalidateHealthyAgent();
+        attemptsLog.push({ attempt, agentId, outcome: 'unparseable' });
+        lastErr = Object.assign(new Error(`OnDemand mail agent did not return a JSON array (got: ${String(r.answer).slice(0, 160)}). NOT falling back to seed data.`), { code: 'MAIL_FETCH_UNPARSEABLE', status: 502, rawAnswer: String(r.answer).slice(0, 500) });
+        logger.warn('mail.fetch.unparseable', { attempt, agentId });
+        if (attempt < MAX_ATTEMPTS) { await _sleep(_backoffMs(attempt)); continue; }
+        break;
+      }
+
+      // (e) success — normalise + enforce recency + newest-first
+      const emails = parsed
+        .map((m, i) => {
+          const dateMs = Date.parse(m.date || m.receivedTime || m.receivedTimeInGMT || '') || null;
+          return {
+            id: String(m.id || m.messageId || `od-${nonce}-${i}`),
+            sender: String(m.sender || m.from || m.fromAddress || 'unknown'),
+            email: String(m.email || m.fromEmail || '').toLowerCase() || null,
+            subject: String(m.subject || '(no subject)'),
+            date: m.date || (dateMs ? new Date(dateMs).toISOString() : null),
+            dateMs,
+            body: String(m.body || m.content || m.snippet || ''),
+          };
+        })
+        .filter((m) => m.dateMs == null || m.dateMs >= cutoff)
+        .sort((a, b) => (b.dateMs || 0) - (a.dateMs || 0))
+        .slice(0, limit);
+
+      _lastSuccessfulSync = { at: new Date().toISOString(), count: emails.length, agentId };
+      logger.info('mail.fetch.ok', { ms: Date.now() - t0, returned: emails.length, days, agentId, attempt });
+      return {
+        ok: true, provider: 'ondemand-live', mailbox: box, lookbackDays: days,
+        since: sinceIso, asOf: nowIso, nonce, agentId,
+        count: emails.length, emails,
+        attemptCount: attempt, lastSuccessfulSyncTimestamp: _lastSuccessfulSync.at,
+      };
+    } catch (e) {
+      if (agentId) failedAgents.add(agentId);
+      invalidateHealthyAgent();
+      lastErr = e; attemptsLog.push({ attempt, agentId, error: String(e?.message || e) });
+      logger.error('mail.fetch.attempt.error', { attempt, agentId, error: String(e?.message || e) });
+      if (attempt < MAX_ATTEMPTS) { await _sleep(_backoffMs(attempt)); continue; }
+    }
+  }
+
+  // (f) exhausted → structured sync-error carrying lastSuccessfulSyncTimestamp.
+  //     The route surfaces this; it NEVER serves stale cached mail.
+  const err = new Error(lastErr ? String(lastErr.message || lastErr) : `live inbox fetch failed after ${MAX_ATTEMPTS} attempts`);
+  err.code = lastErr?.code || 'MAIL_FETCH_FAILED';
+  err.status = lastErr?.status || 502;
+  err.rawAnswer = lastErr?.rawAnswer;
+  err.attempts = attemptsLog;
+  err.lastSuccessfulSyncTimestamp = _lastSuccessfulSync.at;
+  logger.error('mail.fetch.exhausted', { ms: Date.now() - t0, attempts: attemptsLog.length });
+  throw err;
 }
 
 // ------------------------------------------------------------

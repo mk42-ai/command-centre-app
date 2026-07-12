@@ -25,7 +25,7 @@ import {
   generateDailyBriefing, refreshCache, profileSender, semanticSearch, analyzeThread,
 } from './functions/pipeline.js';
 // v31: live mail + file-directory orchestration (fixes #1 fetch, #2 send, #3 attach)
-import { fetchRecentMail, listCompanyFiles, selectRelevantDocument, sendViaOnDemandAgent } from './lib/ondemand-mail.js';
+import { fetchRecentMail, listCompanyFiles, selectRelevantDocument, sendViaOnDemandAgent, lastSuccessfulSync } from './lib/ondemand-mail.js';
 import { buildStructuredEmailHtml } from './lib/mail.js';
 
 export const api = Router();
@@ -61,11 +61,16 @@ api.all('/mail/fetch', async (req, res) => {
     const r = await fetchRecentMail({ lookbackDays: days, maxResults: limit });
     return res.json({ ok: true, ...r });
   } catch (e) {
-    // Clear error — we do NOT fall back to seed data (root-cause fix #1).
+    // v34: explicit structured SYNC ERROR — never serve stale cached inbox state.
+    // The UI must show this error (with lastSuccessfulSyncTimestamp) rather than
+    // silently rendering old mail. Seed fallback remains disabled.
     return res.status(e?.status || 502).json({
       ok: false, provider: 'ondemand-live', code: e?.code || 'MAIL_FETCH_FAILED',
+      syncError: true,
       error: String(e?.message || e), rawAnswer: e?.rawAnswer || undefined,
-      note: 'Live OnDemand mail fetch failed. Seed fallback is intentionally disabled — configure a valid OnDemand mail agent/credential.',
+      attempts: e?.attempts || undefined,
+      lastSuccessfulSyncTimestamp: (e?.lastSuccessfulSyncTimestamp ?? lastSuccessfulSync().at) || null,
+      note: 'Live OnDemand mail fetch failed after retry+failover. Showing an explicit sync error instead of stale cached mail; seed fallback is intentionally disabled.',
       ts: new Date().toISOString(),
     });
   }

@@ -136,7 +136,7 @@ export async function summarizeThread(threadId) {
     out = { summary: seed.summary, action: seed.action, owner: seed.owner, deadline: seed.deadline, impact: seed.impact, source: 'seed' };
   } else {
     const r = await analyse('summary', threadText(emails),
-      `Summarize this email thread for a chief of staff. Reply as JSON {"summary": "...", "action": "...", "owner": "...", "deadline": "...", "impact": "..."}.\nTHREAD:\n${threadText(emails)}`);
+      `CONTEXT: today = ${new Date().toISOString().slice(0,10)}; weight the most recent message in the thread. Summarize this email thread for a chief of staff. Reply as JSON {"summary": "...", "action": "...", "owner": "...", "deadline": "...", "impact": "..."}.\nTHREAD:\n${threadText(emails)}`);
     out = r._offline || r._error
       ? { summary: emails[emails.length - 1].snippet || emails[emails.length - 1].subject, action: 'Review thread', owner: 'Meera', deadline: null, impact: null, source: 'heuristic' }
       : { ...r, source: 'llm' };
@@ -186,7 +186,7 @@ export async function scorePriority(threadId) {
   } else {
     const text = threadText(emails);
     const r = llmConfigured()
-      ? await analyse('priority', text, `Score this email thread for a CEO inbox. Reply JSON {"urgency":1-10,"risk":1-10,"bizValue":1-10,"tier":1-5,"tierReason":"..."} where tier 1 = act today, 5 = archive. THREAD:\n${text}`)
+      ? await analyse('priority', text, `CONTEXT: today = ${new Date().toISOString().slice(0,10)}; weight the most recent message. Score this email thread for a CEO inbox. Reply JSON {"urgency":1-10,"risk":1-10,"bizValue":1-10,"tier":1-5,"tierReason":"..."} where tier 1 = act today, 5 = archive. THREAD:\n${text}`)
       : {};
     const ageDays = (Date.now() - emails[emails.length - 1].internalDate) / 86400000;
     urgency = Number(r.urgency) || Math.max(1, Math.min(10, Math.round(8 - ageDays)));
@@ -214,7 +214,7 @@ export async function analyzeSentiment(threadId) {
   } else {
     const text = threadText(emails);
     const r = llmConfigured()
-      ? await analyse('sentiment', text, `Analyze the sentiment and tone of this email thread. Reply JSON {"sentimentLabel":"...","tone":"...","relationship":"Healthy|Stable|At risk|Strained","riskFlag":true/false}. THREAD:\n${text}`)
+      ? await analyse('sentiment', text, `CONTEXT: today = ${new Date().toISOString().slice(0,10)}; weight the most recent message. Analyze the sentiment and tone of this email thread. Reply JSON {"sentimentLabel":"...","tone":"...","relationship":"Healthy|Stable|At risk|Strained","riskFlag":true/false}. THREAD:\n${text}`)
       : {};
     const negative = /urgent|overdue|disappoint|concern|escalat|final notice|unpaid/i.test(text);
     rec = {
@@ -334,7 +334,7 @@ export async function generateDailyBriefing({ trigger = 'cron' } = {}) {
   if (llmConfigured()) {
     const ctx = JSON.stringify({ topUrgent: top, replyDebt: oweUs, sentimentRisk: risky, tierCounts: dash.tierCounts }).slice(0, 5000);
     const r = await analyse('briefing', `${new Date().toISOString().slice(0, 10)}:${sha256(ctx).slice(0, 16)}`,
-      `You are Meera, chief of staff. Write a crisp 6-10 sentence executive morning briefing for MK's inbox based on this JSON. Reply JSON {"briefing":"..."}. DATA: ${ctx}`, { temperature: 0.4 });
+      `You are Meera, chief of staff. CONTEXT: today = ${new Date().toISOString().slice(0,10)}; prioritise the most recent activity. Write a crisp 6-10 sentence executive morning briefing for MK's inbox based on this JSON. Reply JSON {"briefing":"..."}. DATA: ${ctx}`, { temperature: 0.4 });
     narrative = r?.briefing || null;
   }
   if (!narrative) {
