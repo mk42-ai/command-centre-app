@@ -223,7 +223,7 @@ await test('T2 query.sync recent emails via connector', true, async () => {
 
 async function _queryRecent(sid) {
   const QUERY =
-    'Use your Zoho Mail tools to list the 15 MOST RECENT inbox emails NEWEST FIRST. ' +
+    'Use your Zoho Mail tools to list the 20 MOST RECENT inbox emails NEWEST FIRST. ' +
     'Output STRICT JSON only: an array of {"messageId":"...","sender":"...","subject":"...","receivedTime":<epoch ms>}. ' +
     'CRITICAL — messageId must be a JSON STRING in double quotes (e.g. "1786263130726141900"), copied ' +
     'CHARACTER-FOR-CHARACTER from the mail tool. NEVER a bare number (19-digit ids lose precision as numbers), ' +
@@ -231,7 +231,7 @@ async function _queryRecent(sid) {
   const RETRY_QUERY =
     'Repeat the previous listing but fix the number formatting: every messageId MUST be a double-quoted JSON string ' +
     'copied exactly from the Zoho tool result — bare numeric messageIds are CORRUPTED by JSON precision loss. ' +
-    'Same STRICT JSON array shape, 15 newest inbox emails, newest first. No commentary.';
+    'Same STRICT JSON array shape, 20 newest inbox emails, newest first. No commentary.';
   const doQuery = (q) => fetchJson(`${BASE}/sessions/${encodeURIComponent(sid)}/query`, {
     method: 'POST',
     headers: { apikey: KEY, 'Content-Type': 'application/json' },
@@ -253,30 +253,71 @@ async function _queryRecent(sid) {
     }
     if (resp.status !== 200) throw new Error(`expected HTTP 200, got ${resp.status}: ${JSON.stringify(json).slice(0, 200)}`);
     const answer = json?.data?.answer || '';
+    // v38: ZOHO-THROTTLE AWARENESS (parity with the app's fetchRecentMail) —
+    // when Zoho rejects the connector's listZohoEmails tool ("Access Denied -
+    // too many requests"), the model answers in prose; that is a transient
+    // upstream window, not a parse failure. Signal it so the outer loop can
+    // wait it out instead of burning the retry immediately.
+    if (/access denied|too many requests|rate.?limit/i.test(answer) && !/^\s*\[/.test(answer.trim())) {
+      return { resp, parsed: null, bareCount: 0, zohoThrottled: true, head: String(answer).slice(0, 120) };
+    }
     const parsed = parseJsonIsland(answer);
     if (!Array.isArray(parsed)) throw new Error(`answer did not parse to a JSON array (head: ${String(answer).slice(0, 160)})`);
     // bare-number ids = float-rounded upstream → digits untrustworthy
     const bare = parsed.filter((m) => m?.messageId != null && /^\d{15,}$/.test(String(m.messageId)) && !String(answer).includes(`"${m.messageId}"`));
-    return { resp, parsed, bareCount: bare.length };
+    return { resp, parsed, bareCount: bare.length, zohoThrottled: false };
   };
-  let { resp, parsed, bareCount } = await attemptOnce(QUERY);
-  if ((parsed.length < 10 || bareCount > 0)) {
-    console.log(`[${new Date().toISOString()}] query retrying once (count=${parsed.length}, bareNumberIds=${bareCount})`);
-    const second = await attemptOnce(RETRY_QUERY);
-    if (second.parsed.length >= 10 && second.bareCount === 0) ({ resp, parsed, bareCount } = second);
-    else if (second.parsed.length > parsed.length) ({ resp, parsed, bareCount } = second);
+  // Up to 3 rounds: a Zoho-throttled round waits out the per-minute window
+  // (80s) and retries the SAME query; a short/bare-number round retries once
+  // with the stricter prompt. Total upstream queries bounded at 4.
+  let resp, parsed = [], bareCount = 0;
+  let strictUsed = false;
+  for (let round = 1; round <= 3; round++) {
+    const q = strictUsed ? RETRY_QUERY : QUERY;
+    const r = await attemptOnce(q);
+    if (r.zohoThrottled) {
+      console.log(`[${new Date().toISOString()}] Zoho upstream throttled (round ${round}: ${r.head}) — waiting 80s for the per-minute window`);
+      if (round === 3) throw new Error(`Zoho upstream still rate-limited after ${round} rounds (transient — rerun after cool-down)`);
+      await new Promise((res) => setTimeout(res, 80000));
+      continue;
+    }
+    ({ resp } = r);
+    if (r.parsed.length >= 10 && r.bareCount === 0) { parsed = r.parsed; bareCount = 0; break; }
+    if (r.parsed.length > parsed.length) { parsed = r.parsed; bareCount = r.bareCount; }
+    if (!strictUsed) {
+      console.log(`[${new Date().toISOString()}] query retrying once with strict prompt (count=${r.parsed.length}, bareNumberIds=${r.bareCount})`);
+      strictUsed = true;
+      continue;
+    }
+    break;
   }
   if (parsed.length < 10) throw new Error(`expected >=10 emails, got ${parsed.length}`);
   if (bareCount > 0) throw new Error(`${bareCount} messageIds arrived as bare JSON numbers (precision-corrupted) after retry`);
   return { status: resp.status, parsed, bareCount };
 }
 
+// v38: TRUNCATION-FIT containment (same logic as T4/T7) — the live inbox
+// gains new mail continuously, so a fixed-size window can push the baseline
+// TAIL past the end (observed live: 9 new arrivals in ~2h truncated a
+// 15-email window to only 6 baseline ids). Fit = how many baseline ids the
+// window can still hold after the newer prefix; require >=5 matched to keep
+// the assertion meaningful, plus whole-list newest-first ordering.
+function assertBaselineFit(gotIds, baseline, minFit = 5) {
+  const got = gotIds.map(String);
+  const k = got.indexOf(baseline[0]);
+  if (k === -1) throw new Error(`baseline head ${baseline[0]} not found in returned ids: ${JSON.stringify(got)}`);
+  const fit = Math.min(baseline.length, got.length - k);
+  if (fit < minFit) throw new Error(`window too short: only ${fit} baseline ids fit after ${k} newer arrivals (need >=${minFit})`);
+  assertBaselineContained(got.slice(0, k + fit), baseline.slice(0, fit));
+  return { k, fit };
+}
+
 await test('T3 baseline containment + newest-first ordering', true, async () => {
   if (!queryEmails) throw new Error('no emails from T2');
   let got = queryEmails.map((m) => String(m.messageId));
   try {
-    const { k } = assertBaselineContained(got, BASELINE);
-    return { matched: BASELINE.length, newerPrefix: k, ordering: 'newest-first' };
+    const { k, fit } = assertBaselineFit(got, BASELINE);
+    return { matched: fit, newerPrefix: k, ordering: 'newest-first' };
   } catch (e1) {
     // LLM digit transcription is stochastic: a 19-digit id can arrive with a
     // single corrupted digit even when correctly quoted (observed live:
@@ -286,14 +327,14 @@ await test('T3 baseline containment + newest-first ordering', true, async () => 
     console.log(`[${new Date().toISOString()}] T3 first sample mismatch (${String(e1?.message || e1).slice(0, 110)}) — taking an independent second sample`);
     const second = await connectorRecentIds();
     got = second.parsed.map((m) => String(m.messageId));
-    const { k } = assertBaselineContained(got, BASELINE);
+    const { k, fit } = assertBaselineFit(got, BASELINE);
     queryEmails = second.parsed;
-    return { matched: BASELINE.length, newerPrefix: k, ordering: 'newest-first', secondSample: true };
+    return { matched: fit, newerPrefix: k, ordering: 'newest-first', secondSample: true };
   }
 });
 
 await test('T4 app fetchRecentMail() returns baseline newest-first', true, async () => {
-  const r = await fetchRecentMail({ lookbackDays: 7, maxResults: 15 });
+  const r = await fetchRecentMail({ lookbackDays: 7, maxResults: 20 });
   if (r.ok !== true) throw new Error(`fetchRecentMail returned ok=${r.ok}`);
   if (!Array.isArray(r.emails) || r.emails.length < 1) throw new Error(`fetchRecentMail returned ${r.emails?.length ?? 0} emails`);
   const got = r.emails.map((m) => String(m.messageId));
@@ -361,9 +402,30 @@ await test('T7 dashboard.recentEmails newest-first + baseline containment', true
   // Exercise the REAL dashboard pipeline end-to-end: force a live inbox sync
   // through the connector, rebuild the dashboard, and validate the
   // recentEmails view the UI renders (exact newest-first inbox order).
+  // v38: ZOHO-THROTTLE PACING — T2+T4 just consumed the mailbox's short
+  // window budget (observed lockout ≈4-5 min once tripped), so pace before
+  // the forced sync and retry with 90s waits instead of failing on the
+  // transient. The app's own fetchRecentMail adds its internal 75s waits.
   const { syncInbox, rebuildDashboard } = await import('../server/functions/pipeline.js');
-  await syncInbox({ force: true });
-  const dash = await rebuildDashboard();
+  const throttleRe = /rate.?limit|too many request|access denied|ZOHO_RATE_LIMITED/i;
+  console.log(`[${new Date().toISOString()}] T7 pacing 130s before forced sync (Zoho short-window budget was just used by T2/T4)`);
+  await new Promise((r) => setTimeout(r, 130000));
+  let dash = null;
+  for (let round = 1; round <= 3; round++) {
+    try {
+      await syncInbox({ force: true });
+      dash = await rebuildDashboard();
+      break;
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (throttleRe.test(msg) && round < 3) {
+        console.log(`[${new Date().toISOString()}] T7 round ${round} hit Zoho throttle — waiting 150s and retrying`);
+        await new Promise((r) => setTimeout(r, 150000));
+        continue;
+      }
+      throw e;
+    }
+  }
   if (!Array.isArray(dash.recentEmails)) throw new Error('dashboard.recentEmails is not an array');
   if (dash.recentEmails.length < 10) throw new Error(`expected >=10 recentEmails, got ${dash.recentEmails.length}`);
   for (let i = 1; i < dash.recentEmails.length; i++) {
@@ -425,7 +487,17 @@ await test('T8 deployed preview /api/dashboard/meera returns 200 with LIVE data'
     if (!j?.ok) throw new Error(`ok!=true in dashboard response: ${JSON.stringify(j).slice(0, 160)}`);
     last = j;
     const re = j?.dashboard?.recentEmails || [];
-    if (!j.degraded && re.length >= 10 && String(re[0]?.messageId || '') === BASELINE[0]) break;
+    // Break when live data landed AND the baseline head is PRESENT with only
+    // STRICTLY-NEWER ids above it (containment) — requiring re[0] to EQUAL the
+    // baseline head exactly would falsely time out whenever new mail arrives
+    // between baseline capture and the test run; the anti-stale guarantee is
+    // instead enforced by the dataAgeMs ceiling below plus head-presence here
+    // (a pre-baseline stale cache cannot contain the baseline head at all).
+    const ids = re.map((e) => String(e.messageId));
+    const hk = ids.indexOf(BASELINE[0]);
+    const headEpoch = Number(BASELINE[0].slice(0, 13));
+    const prefixNewer = hk >= 0 && ids.slice(0, hk).every((id) => Number(String(id).slice(0, 13)) >= headEpoch);
+    if (!j.degraded && re.length >= 10 && hk >= 0 && prefixNewer) break;
     if (Date.now() > deadline) throw new Error(`live data did not land within 360s (last source=${j.source}, degraded=${j.degraded}, recentEmails=${re.length}, firstId=${(last?.dashboard?.recentEmails||[])[0]?.messageId})`);
     await new Promise((r) => setTimeout(r, 10000));
   }
