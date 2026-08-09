@@ -83,9 +83,9 @@ if (BASE_PATH) {
 
 const BASE_URL = process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1';
 const API_KEY = process.env.ONDEMAND_API_KEY || '';
-// v21: all model stages default to Claude Sonnet 5 (draft, send, analysis)
-const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5';
+// v36: all model stages default to the endpoint proven live with the Zoho connector (predefined-gemini-3.6-flash); override via ONDEMAND_*_ENDPOINT_ID envs.
+const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
+const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
 const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 const MEDIA_BASE_URL = process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-demand.io/media/v1';
 // v35: media/v1 file ingest `agents` now carries the Zoho connector agent
@@ -411,11 +411,96 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
-// ---------- v29 (RC9): server-side auto-suggest with graceful fallback ----------
+// ---------- v36: multi-shape reply normalization ----------
+// Models return varied shapes for the suggest-replies prompt: a bare JSON
+// array of strings; a JSON array of objects ({reply|body|text|content|draft|
+// message: "..."} or any first string prop); a JSON object wrapping the
+// array under replies/options/drafts/suggestions/answers; fenced ```json
+// blocks; numbered/bulleted lists; or salutation-led prose paragraphs.
+// Normalizes ALL of these into a flat array of usable strings (>=20 chars).
+// Returns [] when nothing usable can be extracted.
+function parseReplyShapes(rawAnswer) {
+  const asStr = (v) => (v == null ? '' : String(v));
+  let text = asStr(rawAnswer).trim();
+  if (!text) return [];
+
+  // strip fenced ```json / ``` blocks, keep the inner content
+  text = text.replace(/```[a-zA-Z]*\s*([\s\S]*?)```/g, '$1').trim();
+
+  const pickStringFromObject = (o) => {
+    if (typeof o === 'string') return o;
+    if (!o || typeof o !== 'object') return '';
+    for (const k of ['reply', 'body', 'text', 'content', 'draft', 'message']) {
+      if (typeof o[k] === 'string' && o[k].trim()) return o[k];
+    }
+    for (const k of Object.keys(o)) {
+      if (typeof o[k] === 'string' && o[k].trim()) return o[k];
+    }
+    return '';
+  };
+  const fromArrayLike = (v) => {
+    if (!Array.isArray(v)) return null;
+    const out = v.map((x) => asStr(pickStringFromObject(x)).trim()).filter((s) => s.length >= 20);
+    return out.length ? out : null;
+  };
+  const tryJson = (str) => { try { return JSON.parse(str); } catch { return null; } };
+
+  // 1. direct JSON parse — bare array of strings/objects, OR a wrapper object
+  let parsed = tryJson(text);
+  if (parsed == null) {
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
+    if (start >= 0 && end > start) parsed = tryJson(text.slice(start, end + 1));
+  }
+  if (parsed == null) {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) parsed = tryJson(text.slice(start, end + 1));
+  }
+  if (parsed != null) {
+    if (Array.isArray(parsed)) {
+      const arr = fromArrayLike(parsed);
+      if (arr) return arr;
+    } else if (typeof parsed === 'object') {
+      for (const k of ['replies', 'options', 'drafts', 'suggestions', 'answers']) {
+        if (Array.isArray(parsed[k])) {
+          const arr = fromArrayLike(parsed[k]);
+          if (arr) return arr;
+        }
+      }
+    }
+  }
+
+  // 2. numbered/bulleted list — only trust it when it yields >=3 real chunks
+  {
+    const parts = text
+      .split(/^\s*(?:\d+[.)]|[-*•])\s+/m)
+      .map((p) => p.trim())
+      .filter((p) => p.length >= 20);
+    if (parts.length >= 3) return parts;
+  }
+
+  // 3. fallback: salutation-led paragraphs separated by a blank line
+  {
+    const parts = text
+      .split(/\n\s*\n(?=(?:Dear|Hi|Hello|Dr|Mr|Ms)\b)/)
+      .map((p) => p.trim())
+      .filter((p) => p.length >= 20);
+    if (parts.length) return parts;
+  }
+
+  return [];
+}
+
+// ---------- v29 (RC9) / v36 (hardened): server-side auto-suggest with
+// graceful fallback ----------
 // POST /api/suggest-replies { thread:{sender,email,org,subject,summary,...}, count? }
-// Live path: one sync OnDemand call (timeout+retry in the shared client) that
-// returns 4 short reply drafts. Degraded path (no key / upstream down after
-// retries): deterministic offlineSuggestions so the UI ALWAYS has content —
+// Live path: one sync OnDemand call (timeout+retry in the shared client),
+// normalized via parseReplyShapes; if that yields <3 options, ONE retry is
+// made on the SAME session with a stricter prompt. If still <3 but >=1
+// usable option survives, the set is padded deterministically with
+// offlineSuggestions() so the UI always renders >=3 replies. Only when ZERO
+// options survive both attempts do we fall back fully to offlineSuggestions,
 // flagged with source:'offline-fallback' so the client can badge it.
 app.post('/api/suggest-replies', async (req, res) => {
   const t = req.body?.thread || {};
@@ -426,29 +511,35 @@ app.post('/api/suggest-replies', async (req, res) => {
     logger.warn('api.suggest.offline', { reason: 'no-key' });
     return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: 'ONDEMAND_API_KEY not configured' });
   }
+  const buildPrompt = () =>
+    `You draft short professional email replies for MK (CEO) / Meera AlDhaheri (Chief of Staff) at AIREV.\n` +
+    `THREAD: from ${t.sender || 'the counterparty'} <${t.email || 'unknown'}> (${t.org || 'their organisation'}) — subject "${t.subject || '(no subject)'}".\n` +
+    `SITUATION: ${t.summary || t.action || 'They await a reply.'}\n` +
+    `TASK: Write exactly 4 alternative SHORT reply emails (2-4 sentences each, max ~70 words), angles: confirm-and-commit, warm relationship repair, crisp status update, firm-but-polite with a date. ` +
+    `Salutation on its own line, blank line, 1-2 short paragraphs, blank line, then sign off exactly: Warm regards,\nMeera AlDhaheri\nChief of Staff, AIREV\n` +
+    `OUTPUT (STRICT): ONLY a JSON array of 4 strings with \\n escapes. No markdown, no commentary.`;
+  const RETRY_PROMPT =
+    'Your previous output could not be parsed. Return ONLY a raw JSON array of exactly 4 strings — ' +
+    '["reply one","reply two","reply three","reply four"] — each a complete short email with \\n escapes. ' +
+    'ABSOLUTELY no markdown fences, no numbering, no object wrappers, no commentary.';
   try {
     const sid = await odCreateSession({ externalUserId: `mcc-suggest-${Date.now()}` });
-    const prompt =
-      `You draft short professional email replies for MK (CEO) / Meera AlDhaheri (Chief of Staff) at AIREV.\n` +
-      `THREAD: from ${t.sender || 'the counterparty'} <${t.email || 'unknown'}> (${t.org || 'their organisation'}) — subject "${t.subject || '(no subject)'}".\n` +
-      `SITUATION: ${t.summary || t.action || 'They await a reply.'}\n` +
-      `TASK: Write exactly 4 alternative SHORT reply emails (2-4 sentences each, max ~70 words), angles: confirm-and-commit, warm relationship repair, crisp status update, firm-but-polite with a date. ` +
-      `Salutation on its own line, blank line, 1-2 short paragraphs, blank line, then sign off exactly: Warm regards,\nMeera AlDhaheri\nChief of Staff, AIREV\n` +
-      `OUTPUT (STRICT): ONLY a JSON array of 4 strings with \\n escapes. No markdown, no commentary.`;
-    const r = await odQuerySync(sid, prompt, { temperature: 0.7 });
-    if (r.ok && r.answer) {
-      try {
-        const m = String(r.answer).match(/\[[\s\S]*\]/);
-        const arr = JSON.parse(m ? m[0] : r.answer);
-        const clean = (Array.isArray(arr) ? arr : []).map((x) => String(x).trim()).filter((x) => x.length >= 20);
-        if (clean.length >= 3) return respond('ondemand-live', clean.slice(0, 4), { sessionId: sid });
-      } catch { /* fall through to fallback below */ }
-      // model answered but not parseable as >=3 options — salvage as one option + fallback pads
-      const one = String(r.answer).trim();
-      if (one.length >= 40) {
-        const pads = offlineSuggestions(t);
-        return respond('ondemand-live-salvaged', [one, ...pads].slice(0, 4), { degraded: true, reason: 'unparseable-array' });
-      }
+    let r = await odQuerySync(sid, buildPrompt(), { temperature: 0.7 });
+    let parsed = r.ok && r.answer ? parseReplyShapes(r.answer) : [];
+    logger.info('api.suggest.attempt', { attempt: 1, parsed: parsed.length });
+    if (parsed.length < 3) {
+      // attempt 2: retry ONCE on the SAME session with an adjusted prompt
+      const r2 = await odQuerySync(sid, RETRY_PROMPT, { temperature: 0.5 });
+      const parsed2 = r2.ok && r2.answer ? parseReplyShapes(r2.answer) : [];
+      logger.info('api.suggest.attempt', { attempt: 2, parsed: parsed2.length });
+      if (parsed2.length > parsed.length) { parsed = parsed2; r = r2; }
+    }
+    if (parsed.length >= 3) return respond('ondemand-live', parsed.slice(0, 4), { sessionId: sid });
+    if (parsed.length >= 1) {
+      // both attempts landed <3 but >=1 usable option — pad deterministically
+      // rather than discard the live content entirely.
+      const combined = parsed.concat(offlineSuggestions(t)).slice(0, 4);
+      return respond('ondemand-live-padded', combined, { degraded: true, reason: 'padded-after-parse', sessionId: sid });
     }
     logger.warn('api.suggest.fallback', { upstreamStatus: r.status });
     return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: `upstream ${r.status}` });

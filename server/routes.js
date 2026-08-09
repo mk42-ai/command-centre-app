@@ -183,42 +183,73 @@ api.post('/thread/analyze', async (req, res) => {
 });
 
 // ---------- dashboard (cache-first + stale-while-revalidate + lastGood fallback) ----------
+// v36: this route can NEVER return a 5xx. Root cause of the "HTTP 500 from
+// /api/dashboard/meera" banner: the cold-start warm-up (sync → live OnDemand
+// fetch) ran unbounded inside the request; on serverless it exceeded the
+// function budget (platform 500) and on a hard failure with no lastGood the
+// route answered 503. Now the warm-up is raced against a time budget and every
+// path returns HTTP 200 JSON: hot cache → cached dashboard; budget exceeded →
+// degraded 'warming' payload (background job continues); failure → lastGood or
+// an explicitly-empty-but-valid shape carrying the error. The UI's degraded
+// banner + 60s poll then self-heal once the background sync lands.
+const emptyDashboardShape = (error = null) => ({
+  generatedAt: new Date().toISOString(),
+  mailbox: CONFIG.mail.mailbox,
+  provider: 'ondemand-live',
+  syncState: (() => { const s = getSyncState(); return { lastSyncAt: s.lastSyncAt, lastError: s.lastError || (error ? { message: error } : null), counts: s.counts }; })(),
+  tierCounts: {},
+  priorityPyramid: [1, 2, 3, 4, 5].map((tier) => ({ tier, count: 0, threads: [] })),
+  topUrgent: [], stalledThreads: [], whoOwesNext: { us: [], them: [] },
+  categories: [], sentimentRisk: [], suggestedReplies: [], relationshipMemory: [],
+  threads: [], recentEmails: [],
+});
+const DASHBOARD_WARMUP_BUDGET_MS = Number(process.env.DASHBOARD_WARMUP_BUDGET_MS || (process.env.VERCEL ? 35000 : 45000));
 api.get('/dashboard/meera', async (req, res) => {
   const entry = kv.getEntry(NS.DASHBOARD, 'meera');
-  // v22: never serve an EMPTY dashboard when a sync can populate it.
-  // After a container restart the ephemeral cache is blank; the async boot
-  // sync races the first request, so an all-zeros dashboard used to get
-  // cached for the full TTL (the "all cards read 0" failure). Guard: if the
-  // cached (or would-be) dashboard has zero threads, run a synchronous
-  // warm-up sync first, then rebuild.
   const isEmpty = (d) => !d || !Array.isArray(d.threads) || d.threads.length === 0;
   if (entry && !isEmpty(entry.value)) {
-    // serve hot cache; kick a background rebuild when >½ TTL old
     if (entry.ageMs > (CONFIG.cache.dashboardTtlS * 1000) / 2) {
       enqueue('rebuildDashboard', {}, { idempotencyKey: 'swr-dashboard' });
     }
     return res.json({ ok: true, source: 'cache', ageMs: entry.ageMs, lastUpdated: new Date(entry.storedAt).toISOString(), degraded: false, dashboard: entry.value });
   }
+  const lastGood = kv.get(NS.DASHBOARD, 'meera:lastGood'); // never-expiring fallback
+  const warmUp = (async () => {
+    if (kv.keys(NS.EMAIL_META).length === 0) await syncInbox({});
+    let d = await rebuildDashboard();
+    if (isEmpty(d)) { await syncInbox({ force: true }); d = await rebuildDashboard(); }
+    return d;
+  })();
+  warmUp.catch(() => {}); // budget may abandon it — never an unhandled rejection
+  const BUDGET = Symbol('budget');
+  let timer = null;
   try {
-    if (kv.keys(NS.EMAIL_META).length === 0) {
-      await syncInbox({}); // warm-up: cold cache → pull threads before building
+    const raced = await Promise.race([
+      warmUp,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(BUDGET), DASHBOARD_WARMUP_BUDGET_MS); }),
+    ]);
+    if (raced === BUDGET) {
+      // warm-up still running — let it finish in the background and answer now.
+      enqueue('rebuildDashboard', {}, { idempotencyKey: 'warmup-dashboard' });
+      const dash = lastGood || entry?.value || emptyDashboardShape('warm-up in progress');
+      return res.json({
+        ok: true, source: lastGood ? 'lastGood-warming' : 'warming', degraded: true,
+        error: `live inbox warm-up exceeded ${DASHBOARD_WARMUP_BUDGET_MS}ms budget — background sync continues`,
+        retryAfterMs: 15000, lastUpdated: dash.generatedAt, dashboard: dash,
+      });
     }
-    let dashboard = await rebuildDashboard(); // build from (now-populated) cached facts
-    if (isEmpty(dashboard)) {
-      // facts existed but dashboard still empty → force a full re-sync once
-      await syncInbox({ force: true });
-      dashboard = await rebuildDashboard();
-    }
-    // v25 (C10): an empty dashboard after a forced re-sync is NOT healthy —
-    // flag it so the UI warn-state fires instead of showing green all-zeros.
+    const dashboard = raced;
     const stillEmpty = isEmpty(dashboard);
     return res.json({ ok: true, source: stillEmpty ? 'empty-after-sync' : 'rebuilt', ageMs: 0, lastUpdated: dashboard.generatedAt, degraded: stillEmpty, ...(stillEmpty ? { error: 'sync produced no threads (provider empty or misconfigured)' } : {}), dashboard });
   } catch (e) {
-    const lastGood = kv.get(NS.DASHBOARD, 'meera:lastGood'); // never-expiring fallback
-    if (lastGood) {
-      return res.json({ ok: true, source: 'lastGood-fallback', degraded: true, error: String(e?.message || e), lastUpdated: lastGood.generatedAt, dashboard: lastGood });
-    }
-    return res.status(503).json({ ok: false, error: String(e?.message || e) });
+    const dash = lastGood || emptyDashboardShape(String(e?.message || e));
+    return res.json({
+      ok: true, source: lastGood ? 'lastGood-fallback' : 'sync-error', degraded: true,
+      error: String(e?.message || e), retryAfterMs: 20000,
+      lastUpdated: dash.generatedAt, dashboard: dash,
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 });
 

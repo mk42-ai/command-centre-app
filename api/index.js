@@ -9,7 +9,7 @@ import '../server/lib/env.js'; // v25: .env loader (gitignored file, server-side
 import express from 'express';
 import { Readable } from 'node:stream';
 import { api as backendApi } from '../server/routes.js';
-import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs } from '../server/lib/ondemand.js';
+import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs, offlineSuggestions } from '../server/lib/ondemand.js';
 // v30: shared copilot session manager + env reconciliation report
 import { ensureCopilotSession, reinitCopilotSession, copilotSessionStatus } from '../server/lib/session.js';
 import { envReconciliation } from '../server/lib/env.js';
@@ -34,8 +34,10 @@ if (APP_TOKEN) {
 
 const BASE_URL = process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1';
 const API_KEY = process.env.ONDEMAND_API_KEY || '';
-const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5';
+// v36: default to the endpoint proven live with the Zoho connector
+// (predefined-gemini-3.6-flash); override via ONDEMAND_*_ENDPOINT_ID envs.
+const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
+const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
 const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 const MEDIA_BASE_URL = process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-demand.io/media/v1';
 // v35: media/v1 file ingest `agents` now carries the Zoho connector agent
@@ -129,7 +131,7 @@ app.post('/api/query', async (req, res) => {
 
 // ---- v23: /api/send — mirrors server.js exactly (was MISSING here, which
 // produced the 'Send failed: send 404' banner on Vercel). Executes the real
-// Zoho send via the agent tool on predefined-claude-sonnet-5, sync mode,
+// Zoho send via the agent tool on the reference-pattern endpoint, sync mode,
 // with heuristic outcome parsing; falls back to a fresh session on 404.
 
 // v27 (Empty-Recipients fix): authoritative delivery-details mapping layer.
@@ -358,6 +360,120 @@ app.post('/api/mail-dataset/poll', async (_req, res) => {
 });
 app.get('/api/mail-dataset/state', (_req, res) => {
   res.json({ ok: true, workflowId: WF_CONFIG.workflowId, pollMinutes: WF_CONFIG.pollMinutes, state: wfIngestState(), ts: new Date().toISOString() });
+});
+
+// ---------- v36: /api/suggest-replies — EXACT parity with server.js ----------
+// This route existed ONLY in server.js; on Vercel the client fallback hit the
+// JSON-404 catch-all below, so when the 4 parallel streams under-delivered the
+// Workbench showed "Generation failed (invalid response shape: fewer than 3
+// usable options)". Same hardened pipeline as server.js: multi-shape parse →
+// one strict-prompt retry on the SAME session → deterministic padding → >=3
+// options ALWAYS returned with ok:true.
+function parseReplyShapes(rawAnswer) {
+  const asStr = (v) => (v == null ? '' : String(v));
+  let text = asStr(rawAnswer).trim();
+  if (!text) return [];
+  text = text.replace(/```[a-zA-Z]*\s*([\s\S]*?)```/g, '$1').trim();
+  const pickStringFromObject = (o) => {
+    if (typeof o === 'string') return o;
+    if (!o || typeof o !== 'object') return '';
+    for (const k of ['reply', 'body', 'text', 'content', 'draft', 'message']) {
+      if (typeof o[k] === 'string' && o[k].trim()) return o[k];
+    }
+    for (const k of Object.keys(o)) {
+      if (typeof o[k] === 'string' && o[k].trim()) return o[k];
+    }
+    return '';
+  };
+  const fromArrayLike = (v) => {
+    if (!Array.isArray(v)) return null;
+    const out = v.map((x) => asStr(pickStringFromObject(x)).trim()).filter((s) => s.length >= 20);
+    return out.length ? out : null;
+  };
+  const tryJson = (str) => { try { return JSON.parse(str); } catch { return null; } };
+  let parsed = tryJson(text);
+  if (parsed == null) {
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
+    if (start >= 0 && end > start) parsed = tryJson(text.slice(start, end + 1));
+  }
+  if (parsed == null) {
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) parsed = tryJson(text.slice(start, end + 1));
+  }
+  if (parsed != null) {
+    if (Array.isArray(parsed)) {
+      const arr = fromArrayLike(parsed);
+      if (arr) return arr;
+    } else if (typeof parsed === 'object') {
+      for (const k of ['replies', 'options', 'drafts', 'suggestions', 'answers']) {
+        if (Array.isArray(parsed[k])) {
+          const arr = fromArrayLike(parsed[k]);
+          if (arr) return arr;
+        }
+      }
+    }
+  }
+  {
+    const parts = text
+      .split(/^\s*(?:\d+[.)]|[-*•])\s+/m)
+      .map((p) => p.trim())
+      .filter((p) => p.length >= 20);
+    if (parts.length >= 3) return parts;
+  }
+  {
+    const parts = text
+      .split(/\n\s*\n(?=(?:Dear|Hi|Hello|Dr|Mr|Ms)\b)/)
+      .map((p) => p.trim())
+      .filter((p) => p.length >= 20);
+    if (parts.length) return parts;
+  }
+  return [];
+}
+
+app.post('/api/suggest-replies', async (req, res) => {
+  const t = req.body?.thread || {};
+  const started = Date.now();
+  const respond = (source, replies, extra = {}) =>
+    res.json({ ok: true, source, replies, count: replies.length, ms: Date.now() - started, ts: new Date().toISOString(), ...extra });
+  if (!odConfigured()) {
+    console.log(JSON.stringify({ level: 'warn', msg: 'api.suggest.offline', reason: 'no-key' }));
+    return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: 'ONDEMAND_API_KEY not configured' });
+  }
+  const buildPrompt = () =>
+    `You draft short professional email replies for MK (CEO) / Meera AlDhaheri (Chief of Staff) at AIREV.\n` +
+    `THREAD: from ${t.sender || 'the counterparty'} <${t.email || 'unknown'}> (${t.org || 'their organisation'}) — subject "${t.subject || '(no subject)'}".\n` +
+    `SITUATION: ${t.summary || t.action || 'They await a reply.'}\n` +
+    `TASK: Write exactly 4 alternative SHORT reply emails (2-4 sentences each, max ~70 words), angles: confirm-and-commit, warm relationship repair, crisp status update, firm-but-polite with a date. ` +
+    `Salutation on its own line, blank line, 1-2 short paragraphs, blank line, then sign off exactly: Warm regards,\nMeera AlDhaheri\nChief of Staff, AIREV\n` +
+    `OUTPUT (STRICT): ONLY a JSON array of 4 strings with \\n escapes. No markdown, no commentary.`;
+  const RETRY_PROMPT =
+    'Your previous output could not be parsed. Return ONLY a raw JSON array of exactly 4 strings — ' +
+    '["reply one","reply two","reply three","reply four"] — each a complete short email with \\n escapes. ' +
+    'ABSOLUTELY no markdown fences, no numbering, no object wrappers, no commentary.';
+  try {
+    const sid = await odCreateSession({ externalUserId: `mcc-suggest-${Date.now()}` });
+    let r = await odQuerySync(sid, buildPrompt(), { temperature: 0.7 });
+    let parsed = r.ok && r.answer ? parseReplyShapes(r.answer) : [];
+    console.log(JSON.stringify({ level: 'info', msg: 'api.suggest.attempt', attempt: 1, parsed: parsed.length }));
+    if (parsed.length < 3) {
+      const r2 = await odQuerySync(sid, RETRY_PROMPT, { temperature: 0.5 });
+      const parsed2 = r2.ok && r2.answer ? parseReplyShapes(r2.answer) : [];
+      console.log(JSON.stringify({ level: 'info', msg: 'api.suggest.attempt', attempt: 2, parsed: parsed2.length }));
+      if (parsed2.length > parsed.length) { parsed = parsed2; r = r2; }
+    }
+    if (parsed.length >= 3) return respond('ondemand-live', parsed.slice(0, 4), { sessionId: sid });
+    if (parsed.length >= 1) {
+      const combined = parsed.concat(offlineSuggestions(t)).slice(0, 4);
+      return respond('ondemand-live-padded', combined, { degraded: true, reason: 'padded-after-parse', sessionId: sid });
+    }
+    console.log(JSON.stringify({ level: 'warn', msg: 'api.suggest.fallback', upstreamStatus: r.status }));
+    return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: `upstream ${r.status}` });
+  } catch (e) {
+    console.log(JSON.stringify({ level: 'error', msg: 'api.suggest.error', error: String(e?.message || e) }));
+    return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: String(e?.message || e).slice(0, 200) });
+  }
 });
 
 app.use('/api', backendApi);

@@ -22,7 +22,7 @@
 import './env.js';
 import crypto from 'node:crypto';
 import { CONFIG } from '../config.js';
-import { createSession, querySync } from './ondemand.js';
+import { createSession, querySync, queryStreamCollect } from './ondemand.js';
 import { localEmbed, cosine } from './cache.js';
 import { logger } from './logger.js';
 
@@ -106,6 +106,16 @@ async function validateAgentAtQuery(agentId) {
 export async function resolveHealthyMailAgent({ force = false, exclude = [] } = {}) {
   const now = Date.now();
   const excluded = new Set(exclude || []);
+  // v36: single-candidate fast path — when only ONE mail agent is available
+  // (the Zoho connector agent-1784351533), the pre-flight health probe is pure
+  // latency (an extra session + query, ~20-45s) with no failover benefit:
+  // the fetch/send call itself is the health check, and the outer retry loop
+  // already handles failure. Skip the probe and bind directly.
+  const avail = MAIL_AGENT_CANDIDATES().filter((c) => !excluded.has(c));
+  if (avail.length === 1) {
+    _healthyAgent = { id: avail[0], at: Date.now() };
+    return { agentId: avail[0], cached: false, probed: [{ agentId: avail[0], healthy: 'assumed-single-candidate' }] };
+  }
   if (!force && _healthyAgent.id && !excluded.has(_healthyAgent.id) && (now - _healthyAgent.at) < HEALTHY_AGENT_TTL_MS) {
     return { agentId: _healthyAgent.id, cached: true, probed: [] };
   }
@@ -133,17 +143,44 @@ function daysAgoIso(days) {
   return new Date(Date.now() - days * 86400000).toISOString();
 }
 
-/** Extract the first JSON array/object island from arbitrary agent text. */
+/** Extract the first JSON array/object island from arbitrary agent text.
+ *  v36 BIG-INT SAFETY: 19-digit Zoho messageIds exceed Number.MAX_SAFE_INTEGER
+ *  (~9.0e15), so when the model emits them as bare JSON numbers, JSON.parse
+ *  silently rounds the tail digits (…141900 → …141760/…142016). Pre-quote any
+ *  bare integer of 15+ digits so ids survive the parse verbatim; 13-digit
+ *  epoch-ms receivedTime values stay numeric (safe under 2^53). */
+function quoteLongInts(s) {
+  // lookahead keeps the trailing delimiter unconsumed so back-to-back long
+  // ints (e.g. bare-id arrays) are all quoted, not every other one.
+  return String(s).replace(/([:\s[,])(\d{15,})(?=\s*[,\]}])/g, '$1"$2"');
+}
 function parseJsonIsland(text) {
   if (!text) return null;
   const fence = String(text).match(/```(?:json)?\s*([\s\S]*?)```/);
-  const body = fence ? fence[1] : String(text);
+  const body = quoteLongInts(fence ? fence[1] : String(text));
   const start = body.search(/[[{]/);
   if (start === -1) return null;
   for (let end = body.length; end > start; end--) {
     try { return JSON.parse(body.slice(start, end)); } catch { /* shrink */ }
   }
   return null;
+}
+
+/** v36: detect BARE-NUMBER messageIds — ids the model emitted WITHOUT quotes.
+ *  A bare 19-digit JSON number has usually already been float-rounded by an
+ *  upstream JSON pipeline (platform tool-result serialization), so its digits
+ *  are untrustworthy even though our own parser preserves them verbatim.
+ *  Returns the list of suspect ids so the caller can retry with a firmer
+ *  quoting directive. Quoted ids ("178…") are exact copies → trusted. */
+function bareNumberIds(parsed, rawAnswer) {
+  const raw = String(rawAnswer || '');
+  const bad = [];
+  for (const m of parsed) {
+    const id = m && m.messageId != null ? String(m.messageId) : null;
+    if (!id || !/^\d{15,}$/.test(id)) continue; // non-Zoho-shaped ids are not checked
+    if (!raw.includes(`"${id}"`)) bad.push(id); // present only as a bare number (or rewritten)
+  }
+  return bad;
 }
 
 // ------------------------------------------------------------
@@ -160,7 +197,23 @@ function parseJsonIsland(text) {
 //     embedded in Zoho messageIds, so newest-first is guaranteed and
 //     externally verifiable.
 // ------------------------------------------------------------
-export async function fetchRecentMail({ lookbackDays = null, maxResults = null, mailbox = null } = {}) {
+// v36: SINGLE-FLIGHT guard — boot sync, dashboard warm-up, and background
+// jobs used to fire CONCURRENT ~50s live connector queries; the parallel
+// sockets intermittently died with 'fetch failed' and every caller lost.
+// Concurrent callers now share ONE in-flight live fetch (same window), which
+// eliminates the contention and halves upstream load.
+let _inflightFetch = { key: null, promise: null };
+export async function fetchRecentMail(opts = {}) {
+  const key = JSON.stringify([opts.lookbackDays ?? null, opts.maxResults ?? null, opts.mailbox ?? null]);
+  if (_inflightFetch.promise && _inflightFetch.key === key) return _inflightFetch.promise;
+  const p = _fetchRecentMailOnce(opts).finally(() => {
+    if (_inflightFetch.promise === p) _inflightFetch = { key: null, promise: null };
+  });
+  _inflightFetch = { key, promise: p };
+  return p;
+}
+
+async function _fetchRecentMailOnce({ lookbackDays = null, maxResults = null, mailbox = null } = {}) {
   if (!mailConfigured()) {
     const e = new Error('OnDemand mail is not configured: ONDEMAND_API_KEY missing. Live inbox fetch requires a valid OnDemand mail credential — the static seed fixture is intentionally disabled.');
     e.code = 'MAIL_NOT_CONFIGURED'; e.status = 503; throw e;
@@ -217,35 +270,67 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
         `LIMIT: at most ${limit} emails.\n` +
         `For EACH email return: messageId (the exact Zoho messageId string from the mail tool — NEVER invent or truncate it), ` +
         `sender (name), email (sender address), subject, receivedTime (epoch milliseconds integer), date (ISO 8601), ` +
-        `and body (the plain-text body as returned by the mail tool; if the tool only provides a summary/snippet, use that; ` +
+        `and body (plain text as returned by the mail tool, TRUNCATED to at most 600 characters — long bodies inflate the ` +
+        `response and cause transport failures; if the tool only provides a summary/snippet, use that; ` +
         `if no body text is available use "" — NEVER invent text and NEVER omit an email because its body is unavailable).\n` +
         `SOURCE OF TRUTH: the mail LISTING tool's metadata (messageId, sender, subject, receivedTime). ` +
         `An email MUST be included whenever the listing tool returns it, even with an empty body.\n` +
         `OUTPUT (STRICT): ONLY a JSON array; each element exactly ` +
         `{"messageId":"...","sender":"...","email":"...","subject":"...","receivedTime":<epoch ms number>,"date":"ISO-8601","body":"..."}. ` +
+        `CRITICAL — messageId format: a JSON STRING wrapped in double quotes (e.g. "1786263130726141900"), ` +
+        `copied CHARACTER-FOR-CHARACTER from the mail tool result. NEVER a bare number, NEVER rounded, ` +
+        `NEVER scientific notation — a 19-digit id loses precision as a number. ` +
+        `Treat messageId as an OPAQUE TEXT TOKEN: do NOT sort by it, do NOT convert it, do NOT perform ANY ` +
+        `numeric operation on it. Keep the emails in the ORDER the mail tool returned them (it already returns ` +
+        `newest first) — do not re-order.\n` +
         `No markdown, no commentary. Output exactly [] ONLY if the inbox LISTING tool itself is unavailable or returns zero emails.`;
 
-      const r = await querySync(sessionId, prompt, {
-        endpointId: SEND_ENDPOINT_ID(),
-        agentIds: [agentId],
-        temperature: 0,
-        timeoutMs: 90000,
-        retries: 0, // outer loop owns retries so we can fail over across agents
-      });
+      // v36: STREAM-COLLECT first, SYNC fallback. The live inbox fetch holds
+      // a sync socket silent for 50-60s while the connector executes its Zoho
+      // tools; upstream infrastructure kills such idle sockets ('fetch
+      // failed'). responseMode:'stream' keeps bytes flowing for the whole
+      // generation. When the SSE stream itself is cut ('terminated' under
+      // upstream load), fall back to a plain sync query WITHIN the same
+      // attempt — the 600-char body cap keeps sync answers fast enough to
+      // beat the idle-socket kill window.
+      let r;
+      try {
+        r = await queryStreamCollect(sessionId, prompt, {
+          endpointId: SEND_ENDPOINT_ID(),
+          agentIds: [agentId],
+          temperature: 0,
+          overallTimeoutMs: 150000,
+          idleTimeoutMs: 60000,
+        });
+      } catch (streamErr) {
+        logger.warn('mail.fetch.stream.fallbackToSync', { attempt, agentId, error: String(streamErr?.message || streamErr).slice(0, 120) });
+        r = await querySync(sessionId, prompt, {
+          endpointId: SEND_ENDPOINT_ID(),
+          agentIds: [agentId],
+          temperature: 0,
+          timeoutMs: 90000,
+          retries: 0,
+        });
+      }
 
-      // (d) upstream 500 / unhealthy agent → exclude + fail over on next attempt
+      // (d) upstream 500 / unhealthy agent → exclude + fail over on next attempt.
+      // v36: HTTP 429 (endpoint TPM rate limit) is NOT an unhealthy agent —
+      // never exclude the connector for it; wait out the per-minute window
+      // and retry on the SAME agent instead.
       if (!r.ok || isAgentUnhealthy(r)) {
-        failedAgents.add(agentId); invalidateHealthyAgent();
-        attemptsLog.push({ attempt, agentId, outcome: `upstream ${r.status}` });
-        lastErr = Object.assign(new Error(`OnDemand mail fetch upstream HTTP ${r.status}: ${JSON.stringify(r.raw || {}).slice(0, 160)}`), { code: 'MAIL_FETCH_UPSTREAM', status: r.status >= 400 ? r.status : 502 });
-        logger.warn('mail.fetch.retry', { attempt, agentId, status: r.status });
-        if (attempt < MAX_ATTEMPTS) { await _sleep(_backoffMs(attempt)); continue; }
+        const isRateLimit = r.status === 429;
+        if (!isRateLimit) { failedAgents.add(agentId); invalidateHealthyAgent(); }
+        attemptsLog.push({ attempt, agentId, outcome: `upstream ${r.status}${isRateLimit ? ' (rate-limit — agent kept)' : ''}` });
+        lastErr = Object.assign(new Error(`OnDemand mail fetch upstream HTTP ${r.status}: ${JSON.stringify(r.raw || {}).slice(0, 160)}`), { code: isRateLimit ? 'MAIL_FETCH_RATE_LIMITED' : 'MAIL_FETCH_UPSTREAM', status: r.status >= 400 ? r.status : 502 });
+        logger.warn('mail.fetch.retry', { attempt, agentId, status: r.status, isRateLimit });
+        if (attempt < MAX_ATTEMPTS) { await _sleep(isRateLimit ? Number(process.env.MAIL_FETCH_429_BACKOFF_MS || 65000) : _backoffMs(attempt)); continue; }
         break;
       }
 
       const parsed = parseJsonIsland(r.answer);
       if (!Array.isArray(parsed)) {
-        failedAgents.add(agentId); invalidateHealthyAgent();
+        if (MAIL_AGENT_CANDIDATES().length > 1) failedAgents.add(agentId);
+        invalidateHealthyAgent();
         attemptsLog.push({ attempt, agentId, outcome: 'unparseable' });
         lastErr = Object.assign(new Error(`OnDemand mail agent did not return a JSON array (got: ${String(r.answer).slice(0, 160)}). NOT falling back to seed data.`), { code: 'MAIL_FETCH_UNPARSEABLE', status: 502, rawAnswer: String(r.answer).slice(0, 500) });
         logger.warn('mail.fetch.unparseable', { attempt, agentId });
@@ -260,6 +345,19 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
       if (parsed.length === 0 && attempt < MAX_ATTEMPTS) {
         attemptsLog.push({ attempt, agentId, outcome: 'empty-array-retry' });
         logger.warn('mail.fetch.empty.retry', { attempt, agentId });
+        await _sleep(_backoffMs(attempt));
+        continue;
+      }
+
+      // v36: PRECISION GUARD — messageIds emitted as BARE JSON numbers have
+      // usually been float-rounded upstream (19-digit ids exceed 2^53), so
+      // their digits are corrupt even when they parse. Retry on a fresh
+      // session (the prompt demands quoted ids); accept only on the final
+      // attempt (ordering still holds via the intact 13-digit epoch prefix).
+      const suspectIds = bareNumberIds(parsed, r.answer);
+      if (suspectIds.length && attempt < MAX_ATTEMPTS) {
+        attemptsLog.push({ attempt, agentId, outcome: `bare-number-ids-retry (${suspectIds.length})` });
+        logger.warn('mail.fetch.bareNumberIds.retry', { attempt, agentId, suspects: suspectIds.length });
         await _sleep(_backoffMs(attempt));
         continue;
       }
@@ -298,7 +396,11 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
         attemptCount: attempt, lastSuccessfulSyncTimestamp: _lastSuccessfulSync.at,
       };
     } catch (e) {
-      if (agentId) failedAgents.add(agentId);
+      // v36: only EXCLUDE the agent when another candidate exists to fail over
+      // to. With a single connector agent, exclusion made every retry die
+      // instantly with 'all excluded' — a transient network error must retry
+      // on the SAME agent instead.
+      if (agentId && MAIL_AGENT_CANDIDATES().length > 1) failedAgents.add(agentId);
       invalidateHealthyAgent();
       lastErr = e; attemptsLog.push({ attempt, agentId, error: String(e?.message || e) });
       logger.error('mail.fetch.attempt.error', { attempt, agentId, error: String(e?.message || e) });

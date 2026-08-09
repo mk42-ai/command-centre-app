@@ -302,6 +302,11 @@ function threadContext(t) {
 // ---------- response schema validation (runs before any option is rendered) ----------
 export function validateReplies(opts) {
   if (!Array.isArray(opts)) throw new Error('invalid response shape: not an array');
+  // v36: accept option OBJECTS too ({reply|body|text|content|draft: "..."}) —
+  // models sometimes return arrays of objects instead of arrays of strings.
+  opts = opts.map((o) => (o && typeof o === 'object' && !Array.isArray(o))
+    ? String(o.reply ?? o.body ?? o.text ?? o.content ?? o.draft ?? '')
+    : o);
   let clean = opts
     .map((s) => String(s == null ? '' : s).trim())
     .filter((s) => s.length >= 20);
@@ -365,14 +370,18 @@ function cleanOptionText(raw) {
 // onOptionDelta(i, textSoFar) streams each option into its own card as tokens arrive.
 export async function generateRepliesParallel(thread, onOptionDelta, attachments = []) {
   const tasks = OPTION_ANGLES.map(async (angle, i) => {
-    // per-option retry: 2 attempts with backoff, only on genuine failure/timeout
+    // v36: per-option retry bumped 2 → 3 attempts; each retry gets a FRESH
+    // session and a firmer prompt suffix (serverless cold-starts + slow
+    // first-byte are the dominant failure mode, not model quality).
     let lastErr;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 700 * attempt));
       try {
         const sessionId = await createSession();
+        const prompt = optionPrompt(thread, angle, attachments) +
+          (attempt > 0 ? '\nREMINDER: output ONLY the raw email text.' : '');
         const raw = await streamQuery(
-          optionPrompt(thread, angle, attachments),
+          prompt,
           (sofar) => onOptionDelta?.(i, cleanOptionText(sofar)),
           { sessionId }
         );
@@ -389,6 +398,13 @@ export async function generateRepliesParallel(thread, onOptionDelta, attachments
   try {
     return validateReplies(out);
   } catch (e) {
+    // v36: salvage — validateReplies pads 1-2 usable drafts up to 3, so any
+    // single successful stream still yields a usable set before we resort to
+    // the server-side fallback.
+    const partial = out.filter((s) => s && s.trim().length >= 20);
+    if (partial.length >= 1) {
+      try { return validateReplies(partial); } catch { /* fall through */ }
+    }
     // v29 (RC9): graceful degradation — when the parallel streaming path
     // cannot produce 3+ usable options (upstream down, key expired, all
     // streams timed out), fall back to the server-side suggest endpoint,
@@ -404,18 +420,24 @@ export async function generateRepliesParallel(thread, onOptionDelta, attachments
 // validated replies or null. Marks the array with __degraded when the server
 // reports fallback content so the Workbench can show a notice.
 export async function suggestRepliesFallback(thread) {
-  try {
-    const r = await fetch(`${API_BASE}/api/suggest-replies`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ thread: { sender: thread.sender, email: thread.email, org: thread.org, subject: thread.subject, summary: thread.summary, action: thread.action } }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || !j?.ok || !Array.isArray(j.replies)) return null;
-    const arr = validateReplies(j.replies);
-    if (j.degraded || String(j.source || '').startsWith('offline')) arr.__degraded = j.reason || j.source;
-    return arr;
-  } catch { return null; }
+  // v36: one cold-start retry — the serverless function may need a moment on
+  // its first invocation; a single 800ms-spaced second attempt covers it.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise((res) => setTimeout(res, 800));
+    try {
+      const r = await fetch(`${API_BASE}/api/suggest-replies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thread: { sender: thread.sender, email: thread.email, org: thread.org, subject: thread.subject, summary: thread.summary, action: thread.action } }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j?.ok || !Array.isArray(j.replies)) { if (attempt === 0) continue; return null; }
+      const arr = validateReplies(j.replies);
+      if (j.degraded || String(j.source || '').startsWith('offline')) arr.__degraded = j.reason || j.source;
+      return arr;
+    } catch { if (attempt === 0) continue; return null; }
+  }
+  return null;
 }
 
 // ---------- suggested replies (3-4 per thread) ----------

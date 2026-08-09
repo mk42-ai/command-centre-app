@@ -111,6 +111,29 @@ function OwesNext({ fu }) {
   );
 }
 
+function RecentEmails({ d }) {
+  // Server order is authoritative (true inbox order, newest first) — do NOT
+  // re-sort here; the messageId rendered per-row is what proves exact
+  // ordering against the live Zoho connector baseline.
+  const list = d?.recentEmails || [];
+  return (
+    <div className="card">
+      <h2>Recent emails (live inbox order)</h2>
+      <div className="hint">True inbox order from the sync pipeline, newest first — not re-sorted in the UI.</div>
+      {!list.length && <div className="hint">No live inbox snapshot yet — run a sync.</div>}
+      {list.map((m) => (
+        <div key={m.messageId} className="tier-item" data-message-id={m.messageId}>
+          <div className="t"><b>{m.sender}</b> · {m.subject}</div>
+          <div style={{ fontSize: '0.75rem', color: 'var(--text2)' }}>
+            {m.receivedAt ? new Date(m.receivedAt).toLocaleString() : '—'}
+            {' '}· <span style={{ fontFamily: 'monospace', fontSize: '0.7rem', color: 'var(--text2)', opacity: 0.75 }}>{m.messageId}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Briefing() {
   const { loading, briefing, error } = useBriefing();
   return (
@@ -216,6 +239,9 @@ export default function LiveOps({ dash }) {
       <div className="grid">
         <CategoryFilters d={d} />
         <Relationships d={d} />
+      </div>
+      <div className="grid">
+        <RecentEmails d={d} />
       </div>
       <div className="card">
         <h2>Pipeline State</h2>

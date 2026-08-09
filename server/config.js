@@ -17,10 +17,10 @@ export const CONFIG = {
   ondemand: {
     baseUrl: process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1',
     apiKey: process.env.ONDEMAND_API_KEY || '',
-    // v21: all model stages default to Claude Sonnet 5
-    draftEndpointId: process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5',
-    sendEndpointId: process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5',
-    analysisEndpointId: process.env.ONDEMAND_ANALYSIS_ENDPOINT_ID || 'predefined-claude-sonnet-5',
+    // v36: all model stages default to the endpoint proven live with the Zoho connector (predefined-gemini-3.6-flash); override via ONDEMAND_*_ENDPOINT_ID envs.
+    draftEndpointId: process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-gemini-3.6-flash',
+    sendEndpointId: process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash',
+    analysisEndpointId: process.env.ONDEMAND_ANALYSIS_ENDPOINT_ID || 'predefined-gemini-3.6-flash',
     agentIds: (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean),
     // v31: the Zoho-Mail-capable OnDemand agent used for live inbox fetch + send.
     // Separated from the generic chat agentIds so the mail path can be pointed

@@ -459,6 +459,28 @@ export async function rebuildDashboard() {
   }
   threads.sort((a, b) => a.tier - b.tier || b.urgency - a.urgency);
 
+  // v36: recent-emails view — EXACT newest-first inbox order by receivedTime
+  // (the dashboard's thread list is tier-sorted, which scrambles recency; the
+  // UI's Recent Emails panel needs the true inbox order, newest first, keyed
+  // by the REAL Zoho messageId so it can be validated against the live API).
+  const recentEmails = emails
+    .map((e) => {
+      const midMs = /^\d{13}/.test(String(e.id)) ? Number(String(e.id).slice(0, 13)) : null;
+      const ms = Number(e.internalDate) || midMs || 0;
+      return {
+        messageId: String(e.id),
+        sender: e.from?.name || e.from?.email || 'unknown',
+        email: e.from?.email || null,
+        subject: e.subject || '(no subject)',
+        receivedTime: ms,
+        receivedAt: ms ? new Date(ms).toISOString() : null,
+        snippet: String(e.snippet || e.body || '').slice(0, 160),
+        threadId: e.threadId,
+      };
+    })
+    .sort((a, b) => (b.receivedTime || 0) - (a.receivedTime || 0))
+    .slice(0, 20);
+
   const tierCounts = {};
   for (const t of threads) tierCounts[t.tier] = (tierCounts[t.tier] || 0) + 1;
 
@@ -471,6 +493,7 @@ export async function rebuildDashboard() {
     tierCounts,
     priorityPyramid: [1, 2, 3, 4, 5].map((tier) => ({ tier, count: tierCounts[tier] || 0, threads: threads.filter((t) => t.tier === tier).map((t) => t.threadId) })),
     topUrgent: threads.filter((t) => t.tier <= 2).slice(0, 8),
+    recentEmails,
     stalledThreads: fu.followups.slice(0, 10),
     whoOwesNext: {
       us: fu.followups.filter((f) => f.owesNext === 'us').map((f) => ({ threadId: f.threadId, subject: f.subject, daysQuiet: f.daysQuiet })),

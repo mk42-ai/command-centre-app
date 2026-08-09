@@ -69,7 +69,7 @@ export default function SendLog() {
                   </td>
                   <td>{e.sentMessageId ? <span className="wb-sendlog-mid">{e.sentMessageId}</span> : '—'}</td>
                   <td>{e.targetMessageId ? <span className="wb-sendlog-mid">{e.targetMessageId}</span> : '—'}</td>
-                  <td className="sendlog-detail">{e.status === 'sent' ? `via ${e.endpoint || 'predefined-claude-sonnet-5'}` : (e.detail || '').slice(0, 140)}</td>
+                  <td className="sendlog-detail">{e.status === 'sent' ? `via ${e.endpoint || 'predefined-gemini-3.6-flash'}` : (e.detail || '').slice(0, 140)}</td>
                 </tr>
               ))}
             </tbody>

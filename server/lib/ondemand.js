@@ -7,7 +7,7 @@
 //       body { agentIds:['agent-1784351533'], externalUserId:<uuid>,
 //              contextMetadata:[{key,value}…] }
 //   • POST {base}/sessions/{id}/query (responseMode:'stream')
-//       body { endpointId:'predefined-claude-sonnet-5', query,
+//       body { endpointId:'predefined-gemini-3.6-flash', query,
 //              agentIds, responseMode:'stream',
 //              modelConfigs:{ fulfillmentPrompt:'', stopSequences:[],
 //                temperature:0.7, topP:1, maxTokens:0,
@@ -40,8 +40,10 @@ const BASE_URL = () => process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.i
 const MEDIA_URL = () => process.env.ONDEMAND_MEDIA_URL || 'https://api.on-demand.io/media/v1/public/file/raw';
 const API_KEY = () => process.env.ONDEMAND_API_KEY || '';
 export const AGENT_IDS = () => (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
-export const DRAFT_ENDPOINT_ID = () => process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-export const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5';
+// v36: default to the endpoint proven live with the Zoho connector
+// (predefined-gemini-3.6-flash); override via ONDEMAND_*_ENDPOINT_ID envs.
+export const DRAFT_ENDPOINT_ID = () => process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
+export const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
 
 const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
 const T_SESSION = () => num(process.env.OD_SESSION_TIMEOUT_MS, 15000);
@@ -152,7 +154,7 @@ export async function createSession({ externalUserId = null, contextMetadata = n
  * The CONNECT phase is time-boxed (T_STREAM); once the stream is open the
  * caller owns idle-timeout policy (the browser client runs its own watchdog).
  */
-export async function queryStream(sessionId, query, { endpointId = null, modelConfigs = null, signal = null } = {}) {
+export async function queryStream(sessionId, query, { endpointId = null, modelConfigs = null, signal = null, agentIds = null } = {}) {
   const t0 = Date.now();
   const { resp, ms } = await fetchTimed(`${BASE_URL()}/sessions/${encodeURIComponent(sessionId)}/query`, {
     method: 'POST',
@@ -160,13 +162,86 @@ export async function queryStream(sessionId, query, { endpointId = null, modelCo
     body: JSON.stringify({
       endpointId: endpointId || DRAFT_ENDPOINT_ID(),
       query: String(query),
-      agentIds: AGENT_IDS(),
+      // v36: per-call agent binding (parity with querySync) for mail-fetch use.
+      agentIds: Array.isArray(agentIds) && agentIds.length ? agentIds : AGENT_IDS(),
       responseMode: 'stream',
       modelConfigs: modelConfigs || fullModelConfigs(),
     }),
   }, { timeoutMs: T_STREAM(), label: 'od.query.stream', signal });
   logger.info('od.query.stream', { status: resp.status, connectMs: ms, totalMs: Date.now() - t0 });
   return resp;
+}
+
+/**
+ * queryStreamCollect — v36: run a query in responseMode:'stream' and COLLECT
+ * the full answer server-side, returning the same { ok, status, answer, raw }
+ * shape as querySync. WHY: long sync waits (>~55s of socket silence while the
+ * agent executes tools + generates) get killed by upstream infrastructure as
+ * 'fetch failed'; SSE keeps bytes flowing on the socket for the entire
+ * generation, so long tool-heavy queries (live inbox fetch) survive. Overall
+ * deadline + idle watchdog guard the read loop.
+ */
+export async function queryStreamCollect(sessionId, query, {
+  endpointId = null, temperature = 0.2, agentIds = null,
+  overallTimeoutMs = 150000, idleTimeoutMs = 45000,
+} = {}) {
+  const t0 = Date.now();
+  const resp = await queryStream(sessionId, query, {
+    endpointId: endpointId || SEND_ENDPOINT_ID(),
+    modelConfigs: fullModelConfigs({ temperature }),
+    agentIds,
+  });
+  if (!resp.ok || !resp.body) {
+    const j = await resp.json().catch(() => ({}));
+    logger.warn('od.query.streamCollect.httpError', { status: resp.status });
+    return { ok: false, status: resp.status, answer: '', raw: j };
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  const acc = sseAccumulator();
+  let lastByteAt = Date.now();
+  // v36: SINGLE tracked pending read that NEVER rejects (two-arg then) — a
+  // naive Promise.race([reader.read(), tick]) abandons the in-flight read on
+  // every tick; when the socket later errors, that abandoned promise rejects
+  // UNHANDLED and kills the whole process. Here every read rejection is
+  // captured and re-thrown inside our control flow instead.
+  let pendingRead = null;
+  try {
+    for (;;) {
+      if (acc.state.done) break;
+      if (Date.now() - t0 > overallTimeoutMs) throw new Error(`stream overall deadline ${overallTimeoutMs}ms exceeded`);
+      if (Date.now() - lastByteAt > idleTimeoutMs) throw new Error(`stream idle for ${idleTimeoutMs}ms`);
+      if (!pendingRead) pendingRead = reader.read().then((res) => ({ res }), (err) => ({ err }));
+      const race = await Promise.race([
+        pendingRead,
+        new Promise((resolve) => setTimeout(() => resolve('tick'), 5000)),
+      ]);
+      if (race === 'tick') continue; // re-check deadlines while the read hangs
+      pendingRead = null;
+      if (race.err) throw race.err instanceof Error ? race.err : new Error(String(race.err));
+      const { done, value } = race.res;
+      if (done) break;
+      lastByteAt = Date.now();
+      acc.feed(decoder.decode(value, { stream: true }));
+    }
+    acc.feed(decoder.decode());
+  } finally {
+    // reader.cancel() returns a PROMISE that REJECTS when the underlying
+    // socket already errored — a bare try/catch only traps sync throws, so
+    // the rejection escaped as an uncaughtException and killed the process
+    // (verified: 'SocketError: other side closed' crash). Attach handlers.
+    try { const c = reader.cancel(); if (c && typeof c.catch === 'function') c.catch(() => {}); } catch { /* already closed */ }
+    // drain a still-pending read so it can never reject unhandled later
+    if (pendingRead) pendingRead.then(() => {}, () => {});
+  }
+  const ms = Date.now() - t0;
+  logger.info('od.query.streamCollect', { status: resp.status, ms, events: acc.state.events, answerChars: acc.state.answer.length });
+  return {
+    ok: true,
+    status: resp.status,
+    answer: acc.state.answer,
+    raw: { sessionId: acc.state.sessionId, messageId: acc.state.messageId, publicMetrics: acc.state.publicMetrics },
+  };
 }
 
 /**
