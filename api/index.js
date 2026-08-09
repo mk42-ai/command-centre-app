@@ -36,13 +36,12 @@ const BASE_URL = process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat
 const API_KEY = process.env.ONDEMAND_API_KEY || '';
 const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5';
 const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean);
+const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 const MEDIA_BASE_URL = process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-demand.io/media/v1';
-// v25: media/v1 file ingest requires a FILE-capable plugin id in `agents` —
-// the chat agent (agent-1741770626) is NOT executable for ingest and returns
-// errors.no.executable.plugin.found (verified live). plugin-1713954536 is the
-// platform Chat-with-Files ingest plugin; override via env when needed.
-const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'plugin-1713954536').split(',').map((s) => s.trim()).filter(Boolean);
+// v35: media/v1 file ingest `agents` now carries the Zoho connector agent
+// (agent-1784351533). Override via ONDEMAND_FILE_AGENT_IDS if a dedicated
+// file-ingest plugin is ever required.
+const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 
 app.get('/api/health', (_req, res) => res.json({
   ok: true, platform: 'vercel', version: 'v31', keyConfigured: odConfigured(),

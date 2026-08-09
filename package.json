@@ -8,7 +8,8 @@
     "build": "vite build",
     "start": "node server.js",
     "preview": "vite preview --host 0.0.0.0 --port 5173",
-    "start:supervised": "node supervisor.js"
+    "start:supervised": "node supervisor.js",
+    "test:e2e": "node test/e2e-live.mjs"
   },
   "dependencies": {
     "express": "^4.19.2",

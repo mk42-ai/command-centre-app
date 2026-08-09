@@ -29,10 +29,12 @@ import { logger } from './logger.js';
 const API_KEY = () => process.env.ONDEMAND_API_KEY || '';
 const MEDIA_BASE = () => (process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-demand.io/media/v1').replace(/\/+$/, '');
 const MAIL_AGENT_IDS = () =>
-  (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626')
+  (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533')
     .split(',').map((s) => s.trim()).filter(Boolean);
 // v32: the endpoint used for BOTH the agent send and the agent fetch queries.
-const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-fable-5';
+// This is the chat v1 reference-pattern endpoint verified live with the
+// connector (env-overridable via ONDEMAND_SEND_ENDPOINT_ID).
+const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
 
 // ============================================================
 // v33 — mail-agent FAILOVER + retry infrastructure.
@@ -49,7 +51,7 @@ const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefi
 // ============================================================
 const MAIL_AGENT_CANDIDATES = () => {
   const primary = MAIL_AGENT_IDS();
-  const extra = (process.env.ONDEMAND_MAIL_AGENT_CANDIDATES || 'agent-1741770626,agent-1722285968')
+  const extra = (process.env.ONDEMAND_MAIL_AGENT_CANDIDATES || 'agent-1784351533')
     .split(',').map((s) => s.trim()).filter(Boolean);
   // primary first, then any others, de-duplicated, preserving order
   return [...new Set([...primary, ...extra])];
@@ -153,6 +155,10 @@ function parseJsonIsland(text) {
 //   • recency contract in the prompt: last {lookbackDays} days ONLY,
 //     sorted NEWEST FIRST, each item {sender,subject,date,body}.
 //   • NEVER returns seed data; throws on missing key / empty agent output.
+//   • v35: messageId + receivedTime are now demanded from the Zoho tool and
+//     preserved verbatim; ordering falls back to the 13-digit epoch-ms prefix
+//     embedded in Zoho messageIds, so newest-first is guaranteed and
+//     externally verifiable.
 // ------------------------------------------------------------
 export async function fetchRecentMail({ lookbackDays = null, maxResults = null, mailbox = null } = {}) {
   if (!mailConfigured()) {
@@ -209,11 +215,15 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
         `or remembered results from any earlier request — fetch fresh every time.\n` +
         `SORT: newest first (most recent receivedTime at the top).\n` +
         `LIMIT: at most ${limit} emails.\n` +
-        `For EACH email return: sender (name + email), subject, date (ISO 8601 receivedTime), ` +
-        `and the FULL plain-text body (not a summary).\n` +
+        `For EACH email return: messageId (the exact Zoho messageId string from the mail tool — NEVER invent or truncate it), ` +
+        `sender (name), email (sender address), subject, receivedTime (epoch milliseconds integer), date (ISO 8601), ` +
+        `and body (the plain-text body as returned by the mail tool; if the tool only provides a summary/snippet, use that; ` +
+        `if no body text is available use "" — NEVER invent text and NEVER omit an email because its body is unavailable).\n` +
+        `SOURCE OF TRUTH: the mail LISTING tool's metadata (messageId, sender, subject, receivedTime). ` +
+        `An email MUST be included whenever the listing tool returns it, even with an empty body.\n` +
         `OUTPUT (STRICT): ONLY a JSON array; each element exactly ` +
-        `{"sender":"Name <email>","email":"email","subject":"...","date":"ISO-8601","body":"full text"}. ` +
-        `No markdown, no commentary. If the inbox tool is unavailable or returns nothing, output exactly [].`;
+        `{"messageId":"...","sender":"...","email":"...","subject":"...","receivedTime":<epoch ms number>,"date":"ISO-8601","body":"..."}. ` +
+        `No markdown, no commentary. Output exactly [] ONLY if the inbox LISTING tool itself is unavailable or returns zero emails.`;
 
       const r = await querySync(sessionId, prompt, {
         endpointId: SEND_ENDPOINT_ID(),
@@ -243,17 +253,35 @@ export async function fetchRecentMail({ lookbackDays = null, maxResults = null, 
         break;
       }
 
+      // v35: an EMPTY array from the agent is suspicious (the listing tool
+      // normally has mail) — retry on a fresh session before accepting it,
+      // so a transient tool hiccup can never masquerade as an empty inbox.
+      // Only the FINAL attempt may return [] (an honestly empty inbox).
+      if (parsed.length === 0 && attempt < MAX_ATTEMPTS) {
+        attemptsLog.push({ attempt, agentId, outcome: 'empty-array-retry' });
+        logger.warn('mail.fetch.empty.retry', { attempt, agentId });
+        await _sleep(_backoffMs(attempt));
+        continue;
+      }
+
       // (e) success — normalise + enforce recency + newest-first
       const emails = parsed
         .map((m, i) => {
-          const dateMs = Date.parse(m.date || m.receivedTime || m.receivedTimeInGMT || '') || null;
+          const msgId = m.messageId != null ? String(m.messageId) : null;
+          // Zoho messageIds embed the receive time: the first 13 digits are
+          // the receivedTime epoch milliseconds, so ordering stays verifiable
+          // even when the agent omits receivedTime.
+          const midMs = msgId && /^\d{13}/.test(msgId) ? Number(msgId.slice(0, 13)) : null;
+          const dateMs = Number(m.receivedTime) || Date.parse(m.date || m.receivedTimeInGMT || '') || midMs || null;
           return {
-            id: String(m.id || m.messageId || `od-${nonce}-${i}`),
+            id: msgId || String(m.id || `od-${nonce}-${i}`),
+            messageId: msgId,
             sender: String(m.sender || m.from || m.fromAddress || 'unknown'),
             email: String(m.email || m.fromEmail || '').toLowerCase() || null,
             subject: String(m.subject || '(no subject)'),
             date: m.date || (dateMs ? new Date(dateMs).toISOString() : null),
             dateMs,
+            receivedTime: dateMs,
             body: String(m.body || m.content || m.snippet || ''),
           };
         })
@@ -401,8 +429,8 @@ export async function uploadAttachmentFromUrl({ url, name, sessionId = null }) {
   if (sessionId) fd.append('sessionId', sessionId);
   // v31 (verified): the media/v1/public/file/raw endpoint REQUIRES an `agents`
   // field — without it the upload 500s for anything but trivial files. Use the
-  // platform Chat-with-Files ingest plugin (override via ONDEMAND_FILE_AGENT_IDS).
-  const fileAgents = (process.env.ONDEMAND_FILE_AGENT_IDS || 'plugin-1713954536').split(',').map((s) => s.trim()).filter(Boolean);
+  // connector agent (override via ONDEMAND_FILE_AGENT_IDS).
+  const fileAgents = (process.env.ONDEMAND_FILE_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
   for (const a of fileAgents) fd.append('agents', a);
 
   const up = await fetch(`${MEDIA_BASE()}/public/file/raw`, { method: 'POST', headers: { apikey: API_KEY() }, body: fd });
@@ -418,11 +446,12 @@ export async function uploadAttachmentFromUrl({ url, name, sessionId = null }) {
 
 // ------------------------------------------------------------
 // v32 — sendViaOnDemandAgent(): route the send THROUGH the OnDemand Zoho
-// mail agent (agent-1741770626), exactly per the reference script pattern.
+// mail agent (agent-1784351533), exactly per the reference script pattern.
 //   1. create a FRESH session (agentIds:[MAIL_AGENT], externalUserId:uuid).
 //   2. upload each attachment binary to media/v1/public/file/raw BOUND to that
 //      fresh sessionId (so the agent can attach it), collecting media IDs/URLs.
-//   3. POST a sync query on predefined-claude-fable-5 whose prompt carries the
+//   3. POST a sync query on the reference-pattern endpoint (SEND_ENDPOINT_ID,
+//      default predefined-gemini-3.6-flash) whose prompt carries the
 //      recipient, subject, full HTML body, and the uploaded media references,
 //      and demands a machine-readable first line "RESULT: SENT <id>" /
 //      "RESULT: FAILED <reason>".

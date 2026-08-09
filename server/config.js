@@ -21,11 +21,11 @@ export const CONFIG = {
     draftEndpointId: process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5',
     sendEndpointId: process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5',
     analysisEndpointId: process.env.ONDEMAND_ANALYSIS_ENDPOINT_ID || 'predefined-claude-sonnet-5',
-    agentIds: (process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean),
+    agentIds: (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean),
     // v31: the Zoho-Mail-capable OnDemand agent used for live inbox fetch + send.
     // Separated from the generic chat agentIds so the mail path can be pointed
     // at a mail-tool agent without disturbing the copilot drafting agent.
-    mailAgentIds: (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean),
+    mailAgentIds: (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean),
     embeddingsUrl: process.env.ONDEMAND_EMBEDDINGS_URL || '', // optional remote embedding endpoint
   },
 

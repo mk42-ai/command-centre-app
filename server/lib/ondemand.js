@@ -4,7 +4,7 @@
 // Pattern (exact integration contract):
 //   • POST {base}/sessions           → 201, data.id = sessionId
 //       headers { apikey, Content-Type: application/json }
-//       body { agentIds:['agent-1741770626'], externalUserId:<uuid>,
+//       body { agentIds:['agent-1784351533'], externalUserId:<uuid>,
 //              contextMetadata:[{key,value}…] }
 //   • POST {base}/sessions/{id}/query (responseMode:'stream')
 //       body { endpointId:'predefined-claude-sonnet-5', query,
@@ -39,7 +39,7 @@ import { logger } from './logger.js';
 const BASE_URL = () => process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1';
 const MEDIA_URL = () => process.env.ONDEMAND_MEDIA_URL || 'https://api.on-demand.io/media/v1/public/file/raw';
 const API_KEY = () => process.env.ONDEMAND_API_KEY || '';
-export const AGENT_IDS = () => (process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean);
+export const AGENT_IDS = () => (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 export const DRAFT_ENDPOINT_ID = () => process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5';
 export const SEND_ENDPOINT_ID = () => process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5';
 

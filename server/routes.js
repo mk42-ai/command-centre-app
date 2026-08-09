@@ -140,7 +140,7 @@ api.post('/send-structured', async (req, res) => {
     });
   }
 
-  // 3. v32: dispatch THROUGH the OnDemand Zoho mail agent (agent-1741770626).
+  // 3. v32: dispatch THROUGH the OnDemand Zoho mail agent (agent-1784351533).
   //    The agent owns the mail credential — no ZOHO_* vars, no zoho-not-configured
   //    block. sendViaOnDemandAgent() opens a fresh session, uploads each
   //    attachment as a REAL binary bound to that session (media/v1/public/file/raw),

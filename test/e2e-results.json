@@ -1,0 +1,102 @@
+{
+  "ranAt": "2026-08-09T07:57:11.304Z",
+  "base": "https://gateway.on-demand.io/chat/v1",
+  "endpointId": "predefined-gemini-3.6-flash",
+  "agentId": "agent-1784351533",
+  "baseline": [
+    "1786255553483141900",
+    "1786255198411141900",
+    "1786252917214141900",
+    "1786252730712141900",
+    "1786241360374141900",
+    "1786229757846141900",
+    "1786227643425141900",
+    "1786227470649141900",
+    "1786219120218141900",
+    "1786218871250141900"
+  ],
+  "results": [
+    {
+      "name": "T1 session.create agentIds=[agent-1784351533]",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T07:55:28.147Z",
+      "endedAt": "2026-08-09T07:55:28.355Z",
+      "ms": 208,
+      "detail": {
+        "status": 201,
+        "sessionId": "6a783270c3a1e609c01239f4"
+      }
+    },
+    {
+      "name": "T2 query.sync recent emails via connector",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T07:55:28.355Z",
+      "endedAt": "2026-08-09T07:55:54.895Z",
+      "ms": 26540,
+      "detail": {
+        "status": 200,
+        "count": 10,
+        "first3Ids": [
+          "1786255553483141900",
+          "1786255198411141900",
+          "1786252917214141900"
+        ]
+      }
+    },
+    {
+      "name": "T3 baseline messageId match + newest-first ordering",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T07:55:54.895Z",
+      "endedAt": "2026-08-09T07:55:54.895Z",
+      "ms": 0,
+      "detail": {
+        "matched": 10,
+        "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T4 app fetchRecentMail() returns baseline newest-first",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T07:55:54.895Z",
+      "endedAt": "2026-08-09T07:57:11.007Z",
+      "ms": 76112,
+      "detail": {
+        "count": 10,
+        "firstId": "1786255553483141900",
+        "agentId": "agent-1784351533",
+        "matchedBaselinePrefix": 10,
+        "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T5 media upload with agents=[connector] (optional)",
+      "required": false,
+      "status": "FAIL",
+      "startedAt": "2026-08-09T07:57:11.007Z",
+      "endedAt": "2026-08-09T07:57:11.299Z",
+      "ms": 292,
+      "error": "media upload HTTP 500: {\"message\":\"errors.no.executable.plugin.found\",\"errorCode\":\"server_error\"}"
+    },
+    {
+      "name": "T6 no legacy IDs remain in codebase",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T07:57:11.299Z",
+      "endedAt": "2026-08-09T07:57:11.303Z",
+      "ms": 4,
+      "detail": {
+        "filesScanned": 41
+      }
+    }
+  ],
+  "summary": {
+    "total": 6,
+    "passed": 5,
+    "failed": 1,
+    "requiredFailed": 0
+  }
+}
