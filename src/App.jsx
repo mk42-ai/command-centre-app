@@ -520,12 +520,12 @@ export default function App() {
             <h1>
               {META.title} <span className="tagline">— {META.tagline}</span>
             </h1>
-            {/* v38: show the LIVE sync date when the dashboard has live data
-                (the hardcoded date read "2026-07-02" forever and made the app
-                look stale even when the API was fresh); when no live data has
-                landed yet, label the bundled fixture date as a SNAPSHOT so it
-                can never be misread as live-data freshness. */}
-            <div className="sub">Prepared for {META.preparedFor} · {dash?.dashboard?.threads?.length ? `live sync ${new Date(dash.lastUpdated || dash.dashboard.generatedAt).toISOString().slice(0, 10)}` : `intelligence snapshot ${META.date}`} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
+            {/* v40 LIVE-ONLY header: show the live sync date when the
+                dashboard has live data; while no live data has landed the
+                header says "awaiting live sync" — the fixture date
+                (2026-07-02) is NEVER rendered here, so a dated header can
+                no longer masquerade as stale data. */}
+            <div className="sub">Prepared for {META.preparedFor} · {dash?.dashboard?.threads?.length ? `live sync ${new Date(dash.lastUpdated || dash.dashboard.generatedAt).toISOString().slice(0, 10)}` : 'awaiting live sync…'} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
           </div>
           <SyncStatusBar dash={dash} />
         </header>
@@ -605,7 +605,7 @@ export default function App() {
         )}
 
         <footer className="footer">
-          Meera's Command Centre — Managing the CEO's Inbox · OnDemand (AIREV) · Intelligence snapshot {META.date} (static views) · Live inbox: see Live Ops · Data source: mk@airev.ae Zoho inbox
+          Meera's Command Centre — Managing the CEO's Inbox · OnDemand (AIREV) · Live-only data (no cached snapshots) · Live inbox: see Live Ops · Data source: mk@airev.ae Zoho inbox
         </footer>
       </div>
 

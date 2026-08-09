@@ -4,8 +4,9 @@
 // milliseconds from the KV cache. Endpoints:
 //   POST /api/inbox/sync       — trigger incremental sync (async | ?wait=1)
 //   POST /api/thread/analyze   — queue full analysis of one thread
-//   GET  /api/dashboard/meera  — dashboard-ready JSON (cache-first,
-//                                stale-while-revalidate, lastGood fallback)
+//   GET  /api/dashboard/meera  — dashboard-ready JSON (LIVE-ONLY: a short
+//                                in-memory hot window + background refresh;
+//                                no snapshot fallback of any kind)
 //   GET  /api/followups        — stalled threads / who owes next reply
 //   GET  /api/sender-profile   — relationship memory (?email= | all)
 //   GET  /api/daily-briefing   — latest (or ?date=YYYY-MM-DD) briefing
@@ -182,16 +183,17 @@ api.post('/thread/analyze', async (req, res) => {
   res.status(202).json({ ok: true, mode: 'async', jobId, deduped, poll: `/api/jobs?id=${jobId}` });
 });
 
-// ---------- dashboard (cache-first + stale-while-revalidate + lastGood fallback) ----------
-// v36: this route can NEVER return a 5xx. Root cause of the "HTTP 500 from
-// /api/dashboard/meera" banner: the cold-start warm-up (sync → live OnDemand
-// fetch) ran unbounded inside the request; on serverless it exceeded the
-// function budget (platform 500) and on a hard failure with no lastGood the
-// route answered 503. Now the warm-up is raced against a time budget and every
-// path returns HTTP 200 JSON: hot cache → cached dashboard; budget exceeded →
-// degraded 'warming' payload (background job continues); failure → lastGood or
-// an explicitly-empty-but-valid shape carrying the error. The UI's degraded
-// banner + 60s poll then self-heal once the background sync lands.
+// ---------- dashboard (LIVE-ONLY — no snapshot fallback of any kind) ----------
+// v40: this route can NEVER return a 5xx and can NEVER serve old data.
+// History: the "HTTP 500" banner came from the unbounded cold-start warm-up
+// blowing the serverless budget; v36 bounded it, v39 removed the lastGood
+// snapshot fallback entirely. What remains is a LIVE-ONLY contract:
+//   • hot window — the dashboard built <=180s ago (dashboardTtlS) is served
+//     from process memory while a background refresh keeps it current;
+//     this is NOT a snapshot store (never persisted, dies with the process);
+//   • budget exceeded → explicit EMPTY degraded 'warming' shape;
+//   • failure → explicit EMPTY degraded 'sync-error' shape.
+// Old inbox data is never rendered under any path, at any age.
 const emptyDashboardShape = (error = null) => ({
   generatedAt: new Date().toISOString(),
   mailbox: CONFIG.mail.mailbox,
@@ -204,9 +206,11 @@ const emptyDashboardShape = (error = null) => ({
   threads: [], recentEmails: [],
 });
 const DASHBOARD_WARMUP_BUDGET_MS = Number(process.env.DASHBOARD_WARMUP_BUDGET_MS || (process.env.VERCEL ? 35000 : 45000));
-// v39 (LIVE-ONLY, supersedes the v38 6h lastGood age-ceiling): the lastGood
-// fallback is removed ENTIRELY — no snapshot of any age is ever served. Only
-// dataAsOf/dataAgeMs freshness metadata survives from v38.
+// v40: MAX AGE of the in-memory hot window that may be served without a
+// rebuild — bounded at the dashboard TTL (180s default). Anything older is
+// treated as absent and a live rebuild runs. Belt-and-braces on top of the
+// kv TTL so no config drift can ever widen the window silently.
+const HOT_WINDOW_MAX_MS = Math.min(Number(process.env.DASHBOARD_HOT_WINDOW_MS || 180000), (CONFIG.cache.dashboardTtlS || 180) * 1000);
 const dashAgeMs = (dash) => {
   const t = Date.parse(dash?.generatedAt || '');
   return Number.isFinite(t) ? Math.max(0, Date.now() - t) : null;
@@ -214,18 +218,23 @@ const dashAgeMs = (dash) => {
 api.get('/dashboard/meera', async (req, res) => {
   const entry = kv.getEntry(NS.DASHBOARD, 'meera');
   const isEmpty = (d) => !d || !Array.isArray(d.threads) || d.threads.length === 0;
+  // v40 LIVE-ONLY hot window: serve the just-built dashboard from process
+  // memory only while it is provably fresh (age <= HOT_WINDOW_MAX_MS AND its
+  // own generatedAt agrees); label it 'live' — the old 'cache' label read as
+  // "cached state" in the UI and hid how fresh the data actually was.
   if (entry && !isEmpty(entry.value)) {
-    if (entry.ageMs > (CONFIG.cache.dashboardTtlS * 1000) / 2) {
-      enqueue('rebuildDashboard', {}, { idempotencyKey: 'swr-dashboard' });
+    const age = dashAgeMs(entry.value);
+    if (entry.ageMs <= HOT_WINDOW_MAX_MS && age != null && age <= HOT_WINDOW_MAX_MS) {
+      if (entry.ageMs > (CONFIG.cache.dashboardTtlS * 1000) / 2) {
+        enqueue('rebuildDashboard', {}, { idempotencyKey: 'swr-dashboard' });
+      }
+      return res.json({ ok: true, source: 'live', ageMs: entry.ageMs, lastUpdated: new Date(entry.storedAt).toISOString(), dataAsOf: entry.value.generatedAt, dataAgeMs: age, degraded: false, dashboard: entry.value });
     }
-    return res.json({ ok: true, source: 'cache', ageMs: entry.ageMs, lastUpdated: new Date(entry.storedAt).toISOString(), dataAsOf: entry.value.generatedAt, dataAgeMs: dashAgeMs(entry.value), degraded: false, dashboard: entry.value });
+    // hot window exceeded → fall through to a LIVE rebuild (never serve it)
   }
-  // v39 (LIVE-ONLY, supersedes the v38 6h age-ceiling): the never-expiring
-  // 'meera:lastGood' stale-snapshot fallback is REMOVED entirely — the
-  // dashboard must never render old cached emails at ANY age. On warm-up
-  // overrun or failure the route answers with an explicitly EMPTY
-  // (degraded-labelled) shape; the UI shows its warming/sync banner and the
-  // 60s poll picks up the live rebuild. Stale data is never served.
+  // LIVE-ONLY: no snapshot fallback exists — on warm-up overrun or failure
+  // the route answers with an explicitly EMPTY (degraded-labelled) shape;
+  // the UI shows its sync banner and the 60s poll picks up the live rebuild.
   const warmUp = (async () => {
     if (kv.keys(NS.EMAIL_META).length === 0) await syncInbox({});
     let d = await rebuildDashboard();

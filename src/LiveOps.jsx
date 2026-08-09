@@ -14,13 +14,16 @@ import { useBriefing, useFollowups, fmtAgo } from './backend.js';
 
 export function SyncStatusBar({ dash }) {
   const { lastUpdated, source, degraded, error, loading, sync, refresh } = dash;
+  // v40 LIVE-ONLY: there is no cached state anywhere in the stack, so the
+  // banner never claims one. A failed/degraded sync reads as exactly that —
+  // live sync unavailable, retrying — and the view renders empty, not stale.
   return (
     <div className="syncbar" role="status">
       <span className={`sync-dot ${error ? 'err' : degraded ? 'warn' : 'ok'}`} aria-hidden="true" />
       <span className="sync-txt">
         {error
-          ? <>sync issue — showing last cached state <b title={error}>({String(error).slice(0, 60)})</b></>
-          : <>last updated <b title={lastUpdated || ''}>{fmtAgo(lastUpdated)}</b>{source ? ` · ${source}` : ''}{degraded ? ' · degraded (lastGood fallback)' : ''}</>}
+          ? <>live sync unavailable — retrying <b title={error}>({String(error).slice(0, 60)})</b></>
+          : <>last updated <b title={lastUpdated || ''}>{fmtAgo(lastUpdated)}</b>{source ? ` · ${source}` : ''}{degraded ? ' · syncing (live-only, no cached data shown)' : ''}</>}
       </span>
       <button className="sync-btn" onClick={sync} disabled={loading} title="Incremental inbox sync (only new/changed threads)">
         <Icon name="refresh" size={13} /> Sync

@@ -656,11 +656,13 @@ app.listen(PORT, '0.0.0.0', () => {
   warmupCopilotSession().then((sid) => {
     console.log(`[v30] copilot session warm-up: ${sid ? `ready (${sid})` : 'deferred (will lazy-init on first request)'}`);
   }).catch(() => {});
-  // boot warm-up: one incremental sync primes the cache so the very first
-  // dashboard request is served hot; failures fall back to lastGood state.
+  // boot warm-up: one incremental sync primes the live model so the very
+  // first dashboard request is served hot. v40 LIVE-ONLY: on failure the
+  // dashboard answers with an explicit degraded-empty shape (never any
+  // cached/snapshot state) and the next poll retries the live sync.
   syncInbox({}).then((r) => {
     console.log(`[v19] boot sync: provider=${r.provider} seen=${r.seen} newOrChanged=${r.newOrChanged}`);
-  }).catch((e) => console.error(`[v19] boot sync failed (dashboard serves lastGood fallback): ${e?.message || e}`));
+  }).catch((e) => console.error(`[v40] boot sync failed (dashboard stays live-only degraded-empty until a sync lands): ${e?.message || e}`));
   process.on('SIGTERM', () => { kv.flush(); process.exit(0); });
   process.on('SIGINT', () => { kv.flush(); process.exit(0); });
 });

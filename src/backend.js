@@ -58,8 +58,13 @@ export function useDashboard({ pollMs = 60000 } = {}) {
       setState({ loading: false, dashboard: j.dashboard, lastUpdated: j.lastUpdated, source: j.source, degraded: Boolean(j.degraded), error: j.degraded ? (j.error || 'degraded') : null });
     } catch (e) {
       if (!alive.current) return;
-      // keep last good in-browser copy; surface the sync-failure state
-      setState((s) => ({ ...s, loading: false, error: String(e?.message || e) }));
+      // v40 LIVE-ONLY: DROP the in-browser copy on fetch failure. Keeping it
+      // was the final stale-render path — when the backend died (sandbox
+      // expiry / process crash), the SPA kept showing the last dashboard
+      // (and its dated header) indefinitely under a "cached state" banner.
+      // Now the data disappears with the connection and the banner reads
+      // "live sync unavailable — retrying"; the 60s poll self-heals.
+      setState({ loading: false, dashboard: null, lastUpdated: null, source: null, degraded: true, error: String(e?.message || e) });
     }
   }, []);
 

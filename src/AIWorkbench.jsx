@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { THREADS, TIER_INFO } from './data.js';
+import { TIER_INFO } from './data.js';
 import { toast } from 'sonner';
 import { motion, useReducedMotion } from 'framer-motion';
 import { generateRepliesParallel, refineReply, reviseReplyFreeform, matchDoc, DOCS, MICRO_COMMANDS, sendReply, uploadAttachment, loadSendLog, appendSendLog, DISMISS_OPTIONS, CURRENT_USER, recordDismissal, undoDismissal, loadDismissals } from './ai.js';
@@ -539,7 +539,11 @@ export default function AIWorkbench({ resolved, onResolve, onUnresolve, dash }) 
     }));
   }, [dash?.dashboard?.threads]);
   const usingLive = liveThreads.length > 0;
-  const SOURCE_THREADS = usingLive ? liveThreads : THREADS;
+  // v40 LIVE-ONLY: the July-2026 fixture fallback is REMOVED — when no live
+  // data has landed the workbench renders an explicit empty "awaiting live
+  // sync" state instead of the dated snapshot. The 2026-07-02 content can
+  // no longer appear in this view under any condition.
+  const SOURCE_THREADS = liveThreads;
 
   const active = useMemo(
     () => SOURCE_THREADS.filter((t) => !resolved[t.id] && (tierF === 0 || t.tier === tierF)).sort((a, b) => a.tier - b.tier || b.urgency - a.urgency),
@@ -553,10 +557,10 @@ export default function AIWorkbench({ resolved, onResolve, onUnresolve, dash }) 
       <div className="hint">
         Live suggested replies per thread (OnDemand · gemini-3.6-flash via server-side proxy) · micro-commands: warmer / firmer / shorter / formal / add deadline / soften · approve triggers document auto-attach · dismiss stamps MK / SK / MA ownership.
       </div>
-      <div className="hint" data-thread-source={usingLive ? 'live' : 'snapshot'}>
+      <div className="hint" data-thread-source={usingLive ? 'live' : 'awaiting-live-sync'}>
         {usingLive
           ? <>Threads: <b>LIVE inbox</b> — synced {dash?.lastUpdated ? new Date(dash.lastUpdated).toLocaleString() : 'just now'} via the Zoho connector (newest first by tier).</>
-          : <>Threads: <b style={{ color: '#B54708' }}>July 2026 snapshot (offline fallback)</b> — live inbox not loaded yet; press Sync or wait for the next poll.</>}
+          : <>Threads: <b style={{ color: '#B54708' }}>awaiting live sync…</b> — no data is shown until the live inbox loads (live-only, no cached snapshots); press Sync or wait for the next poll.</>}
       </div>
       <div className="controls">
         {[0, 1, 2, 3, 4, 5].map((t) => (
