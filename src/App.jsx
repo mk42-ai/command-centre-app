@@ -520,7 +520,10 @@ export default function App() {
             <h1>
               {META.title} <span className="tagline">— {META.tagline}</span>
             </h1>
-            <div className="sub">Prepared for {META.preparedFor} · {META.date} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
+            {/* v38: show the LIVE sync date when the dashboard has live data —
+                the hardcoded snapshot date read "2026-07-02" forever and made
+                the whole app look stale even when the API was fresh. */}
+            <div className="sub">Prepared for {META.preparedFor} · {dash?.dashboard?.threads?.length ? `live sync ${new Date(dash.lastUpdated || dash.dashboard.generatedAt).toISOString().slice(0, 10)}` : META.date} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
           </div>
           <SyncStatusBar dash={dash} />
         </header>
@@ -571,7 +574,9 @@ export default function App() {
 
         {section === 'workbench' && (
           <div className="grid">
-            <AIWorkbench resolved={resolved} onResolve={resolve} onUnresolve={unresolve} />
+            {/* v38: pass the live dashboard so the Workbench renders the LIVE
+                inbox (July snapshot only as a labelled offline fallback). */}
+            <AIWorkbench resolved={resolved} onResolve={resolve} onUnresolve={unresolve} dash={dash} />
           </div>
         )}
 

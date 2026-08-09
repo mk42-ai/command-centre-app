@@ -48,7 +48,12 @@ export const CONFIG = {
     maxResults: num(process.env.MAIL_MAX_RESULTS, 50),
     // v31: SHORT cache TTL for inbox fetches (was 7-day summary TTL) so the
     // dashboard reflects new mail within minutes, not days. Set 0 to bypass.
-    fetchTtlS: num(process.env.MAIL_FETCH_TTL_S, 180), // 3 minutes
+    // v38 (STALE-DECAY FIX, leg 3): 180s was SHORTER than the 10-minute
+    // inboxSync cron interval, so even with per-sync TTL renewal a single
+    // failed/slow sync let EMAIL_META entries lapse and the dashboard decay.
+    // 1800s (30 min) tolerates two missed cron ticks while still turning
+    // over stale mail within half an hour; env-overridable as before.
+    fetchTtlS: num(process.env.MAIL_FETCH_TTL_S, 1800), // 30 minutes
     mailbox: process.env.MAILBOX_ADDRESS || 'mk@airev.ae',
   },
 

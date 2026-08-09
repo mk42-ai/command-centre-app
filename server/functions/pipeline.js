@@ -45,7 +45,15 @@ function putSyncState(s) { kv.set(NS.SYNC_STATE, 'inbox', s, 0); }
 export async function syncInbox({ force = false, maxResults = 100 } = {}) {
   const provider = await getMailProvider();
   const state = getSyncState();
-  const after = force ? null : (state.lastInternalDate || null);
+  // v38: ALWAYS fetch the FULL lookback window. The old incremental narrowing
+  // (afterEpochMs = lastInternalDate) meant a later sync fetched ONLY mail
+  // newer than the last sync — so once an EMAIL_META entry expired it could
+  // NEVER be re-fetched (the decay's second leg). The OnDemand connector
+  // fetches a whole lookback window in one query regardless (afterEpochMs
+  // was ceil'd to >=1 day anyway), so incremental narrowing saved nothing
+  // while silently starving the cache. Full-window + checksum skip keeps
+  // idempotency; force still bypasses the analysis skip.
+  const after = null;
 
   let messages;
   try {
@@ -61,13 +69,16 @@ export async function syncInbox({ force = false, maxResults = 100 } = {}) {
     const csum = messageChecksum(m);
     const prev = state.processed[m.id];
     state.counts.totalSeen++;
-    if (prev && prev.checksum === csum && !force) { state.counts.skipped++; continue; } // idempotent skip
-    state.processed[m.id] = { checksum: csum, threadId: m.threadId, at: Date.now() };
-    newOrChanged.push({ m, csum, changed: Boolean(prev) });
-    // email metadata cache — the dashboard's raw source.
-    // v31 (FIX #1): SHORT TTL (CONFIG.mail.fetchTtlS, default 3 min) instead of
-    // the old 24h (defaultTtlS*4) so fresh inbox mail is never masked by a
-    // day-old cached copy. Also persists the full `body` from the live fetch.
+    // v38 (STALE-DECAY ROOT-CAUSE FIX): ALWAYS (re)write the EMAIL_META cache
+    // entry for EVERY message the provider returns — BEFORE the idempotent
+    // skip. Previously the checksum-skip fired first, so an UNCHANGED
+    // message's cache entry was written exactly once and expired fetchTtlS
+    // later, never to be refreshed (state.processed is not TTL'd, so every
+    // later sync skipped the re-write). rebuildDashboard() reads
+    // kv.all(EMAIL_META), so threads/recentEmails silently DECAYED between
+    // syncs (observed live on the preview: 20 → 6 entries in ~40 min).
+    // Re-setting on every sync renews the TTL, so an entry now only expires
+    // when the provider genuinely stops returning that message.
     kv.set(NS.EMAIL_META, m.id, {
       id: m.id, threadId: m.threadId, historyId: m.historyId,
       subject: headerValue(m, 'Subject'), from: parseAddress(headerValue(m, 'From')),
@@ -79,6 +90,11 @@ export async function syncInbox({ force = false, maxResults = 100 } = {}) {
       cachedAt: nowIso(),
     }, CONFIG.mail.fetchTtlS || CONFIG.cache.defaultTtlS);
     state.lastInternalDate = Math.max(state.lastInternalDate || 0, Number(m.internalDate) || 0);
+    // idempotent ANALYSIS skip — unchanged messages skip re-analysis only;
+    // their cache entry above is always refreshed.
+    if (prev && prev.checksum === csum && !force) { state.counts.skipped++; continue; }
+    state.processed[m.id] = { checksum: csum, threadId: m.threadId, at: Date.now() };
+    newOrChanged.push({ m, csum, changed: Boolean(prev) });
   }
 
   // cap processed-map growth (keep newest 2000 message states)

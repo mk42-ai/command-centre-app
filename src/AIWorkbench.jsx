@@ -502,21 +502,61 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
   );
 }
 
-export default function AIWorkbench({ resolved, onResolve, onUnresolve }) {
+export default function AIWorkbench({ resolved, onResolve, onUnresolve, dash }) {
   const [tierF, setTierF] = useState(0);
   const [showResolved, setShowResolved] = useState(false);
 
+  // v38 (LIVE-FIRST FIX — the "stale July 8th emails" root cause): this view
+  // previously rendered ONLY the static July-2026 snapshot compiled into
+  // src/data.js, regardless of what /api/dashboard/meera returned. It now
+  // consumes the LIVE dashboard threads whenever they are available (mapped
+  // to the workbench thread shape); the July snapshot remains ONLY as a
+  // clearly-labelled offline fallback when the backend has no live data yet.
+  const liveThreads = useMemo(() => {
+    const list = dash?.dashboard?.threads || [];
+    return list.map((t) => ({
+      id: t.threadId,
+      zoho: t.zoho || { messageId: String(t.threadId) },
+      sender: t.sender || t.email || 'unknown',
+      email: t.email || '',
+      org: t.org || '',
+      role: '',
+      subject: t.subject || '(no subject)',
+      lastActivity: t.lastActivity || null,
+      summary: t.summary || '',
+      tier: t.tier ?? 3,
+      tierReason: t.tierReason || '',
+      sentiment: t.sentiment || 'Neutral',
+      urgency: t.urgency ?? 5,
+      risk: t.risk ?? 4,
+      bizValue: t.bizValue ?? 5,
+      relationship: t.relationship || 'Unknown',
+      owner: t.owner || null,
+      action: t.action || null,
+      deadline: t.deadline || null,
+      bucket: t.bucket || null,
+      category: t.category || null,
+    }));
+  }, [dash?.dashboard?.threads]);
+  const usingLive = liveThreads.length > 0;
+  const SOURCE_THREADS = usingLive ? liveThreads : THREADS;
+
   const active = useMemo(
-    () => THREADS.filter((t) => !resolved[t.id] && (tierF === 0 || t.tier === tierF)).sort((a, b) => a.tier - b.tier || b.urgency - a.urgency),
-    [resolved, tierF]
+    () => SOURCE_THREADS.filter((t) => !resolved[t.id] && (tierF === 0 || t.tier === tierF)).sort((a, b) => a.tier - b.tier || b.urgency - a.urgency),
+    [SOURCE_THREADS, resolved, tierF]
   );
-  const done = useMemo(() => THREADS.filter((t) => resolved[t.id]), [resolved]);
+  const done = useMemo(() => SOURCE_THREADS.filter((t) => resolved[t.id]), [SOURCE_THREADS, resolved]);
 
   return (
     <div className="card">
       <h2>AI Reply Workbench <span className="wb-live-dot" title="Live inference via OnDemand" /></h2>
       <div className="hint">
-        Live suggested replies per thread (OnDemand · claude-sonnet-5 via server-side proxy) · micro-commands: warmer / firmer / shorter / formal / add deadline / soften · approve triggers document auto-attach · dismiss stamps MK / SK / MA ownership.
+        Live suggested replies per thread (OnDemand · gemini-3.6-flash via server-side proxy) · micro-commands: warmer / firmer / shorter / formal / add deadline / soften · approve triggers document auto-attach · dismiss stamps MK / SK / MA ownership.
+      </div>
+      <div className="hint" data-thread-source={usingLive ? 'live' : 'snapshot'}>
+        {usingLive
+          ? <>Threads: <b>LIVE inbox</b> — synced {dash?.lastUpdated ? new Date(dash.lastUpdated).toLocaleString() : 'just now'} via the Zoho connector (newest first by tier).</>
+          : <>Threads: <b style={{ color: '#B54708' }}>July 2026 snapshot (offline fallback)</b> — live inbox not loaded yet; press Sync or wait for the next poll.</>}
       </div>
       <div className="controls">
         {[0, 1, 2, 3, 4, 5].map((t) => (
