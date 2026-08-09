@@ -520,10 +520,12 @@ export default function App() {
             <h1>
               {META.title} <span className="tagline">— {META.tagline}</span>
             </h1>
-            {/* v38: show the LIVE sync date when the dashboard has live data —
-                the hardcoded snapshot date read "2026-07-02" forever and made
-                the whole app look stale even when the API was fresh. */}
-            <div className="sub">Prepared for {META.preparedFor} · {dash?.dashboard?.threads?.length ? `live sync ${new Date(dash.lastUpdated || dash.dashboard.generatedAt).toISOString().slice(0, 10)}` : META.date} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
+            {/* v38: show the LIVE sync date when the dashboard has live data
+                (the hardcoded date read "2026-07-02" forever and made the app
+                look stale even when the API was fresh); when no live data has
+                landed yet, label the bundled fixture date as a SNAPSHOT so it
+                can never be misread as live-data freshness. */}
+            <div className="sub">Prepared for {META.preparedFor} · {dash?.dashboard?.threads?.length ? `live sync ${new Date(dash.lastUpdated || dash.dashboard.generatedAt).toISOString().slice(0, 10)}` : `intelligence snapshot ${META.date}`} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
           </div>
           <SyncStatusBar dash={dash} />
         </header>
@@ -603,7 +605,7 @@ export default function App() {
         )}
 
         <footer className="footer">
-          Meera's Command Centre — Managing the CEO's Inbox · OnDemand (AIREV) · Generated {META.date} · Data source: mk@airev.ae Zoho inbox intelligence
+          Meera's Command Centre — Managing the CEO's Inbox · OnDemand (AIREV) · Intelligence snapshot {META.date} (static views) · Live inbox: see Live Ops · Data source: mk@airev.ae Zoho inbox
         </footer>
       </div>
 

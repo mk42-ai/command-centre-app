@@ -204,9 +204,24 @@ function bareNumberIds(parsed, rawAnswer) {
 // eliminates the contention and halves upstream load.
 let _inflightFetch = { key: null, promise: null };
 export async function fetchRecentMail(opts = {}) {
-  const key = JSON.stringify([opts.lookbackDays ?? null, opts.maxResults ?? null, opts.mailbox ?? null]);
+  // v38 (audit d fix): NORMALIZE the key by resolving defaults FIRST — the
+  // raw-opts key made route callers ([null,null,null]) and pipeline callers
+  // ([1,100,null]) look different, so they bypassed the single-flight and
+  // fired PARALLEL live connector queries (double Zoho per-minute pressure,
+  // self-inflicted throttle). After normalization, equivalent windows share
+  // one flight; NON-equivalent windows are SERIALIZED behind the current
+  // flight instead of running concurrently — at most ONE live connector
+  // query is in flight at any moment, ever.
+  const days = opts.lookbackDays ?? CONFIG.mail.lookbackDays;
+  const limit = opts.maxResults ?? CONFIG.mail.maxResults;
+  const box = opts.mailbox ?? CONFIG.mail.mailbox;
+  const key = JSON.stringify([days, limit, box]);
   if (_inflightFetch.promise && _inflightFetch.key === key) return _inflightFetch.promise;
-  const p = _fetchRecentMailOnce(opts).finally(() => {
+  const prior = _inflightFetch.promise; // different window → wait, then run
+  const p = (async () => {
+    if (prior) await prior.catch(() => {}); // serialize; prior's outcome is its caller's concern
+    return _fetchRecentMailOnce({ lookbackDays: days, maxResults: limit, mailbox: box });
+  })().finally(() => {
     if (_inflightFetch.promise === p) _inflightFetch = { key: null, promise: null };
   });
   _inflightFetch = { key, promise: p };
@@ -319,7 +334,11 @@ async function _fetchRecentMailOnce({ lookbackDays = null, maxResults = null, ma
       // and retry on the SAME agent instead.
       if (!r.ok || isAgentUnhealthy(r)) {
         const isRateLimit = r.status === 429;
-        if (!isRateLimit) { failedAgents.add(agentId); invalidateHealthyAgent(); }
+        // v38: single-candidate guard here too (audit d finding) — a lone
+        // transient 5xx must not exclude the ONLY connector agent, or the
+        // remaining attempts die instantly with NO_HEALTHY_AGENT.
+        if (!isRateLimit && MAIL_AGENT_CANDIDATES().length > 1) { failedAgents.add(agentId); }
+        if (!isRateLimit) { invalidateHealthyAgent(); }
         attemptsLog.push({ attempt, agentId, outcome: `upstream ${r.status}${isRateLimit ? ' (rate-limit — agent kept)' : ''}` });
         lastErr = Object.assign(new Error(`OnDemand mail fetch upstream HTTP ${r.status}: ${JSON.stringify(r.raw || {}).slice(0, 160)}`), { code: isRateLimit ? 'MAIL_FETCH_RATE_LIMITED' : 'MAIL_FETCH_UPSTREAM', status: r.status >= 400 ? r.status : 502 });
         logger.warn('mail.fetch.retry', { attempt, agentId, status: r.status, isRateLimit });

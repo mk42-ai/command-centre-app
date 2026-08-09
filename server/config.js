@@ -123,7 +123,14 @@ export const CONFIG = {
     maxMs: num(process.env.RETRY_MAX_MS, 15000),
   },
   rateLimit: {
-    llmPerMin: num(process.env.LLM_RATE_PER_MIN, 30),
+    // v38 (audit d, finding 4): background analysis shares the SAME OnDemand
+    // endpoint as the live mail fetch. The old 30/min default let a post-sync
+    // burst of ~30 analysis queries starve the endpoint's TPM budget and
+    // 429 the NEXT inbox fetch (which then pushed the dashboard onto the
+    // lastGood fallback). 10/min keeps analysis flowing while leaving the
+    // mail fetch ample headroom; raise via LLM_RATE_PER_MIN when a dedicated
+    // analysis endpoint is configured (ONDEMAND_ANALYSIS_ENDPOINT_ID).
+    llmPerMin: num(process.env.LLM_RATE_PER_MIN, 10),
     zohoPerMin: num(process.env.ZOHO_RATE_PER_MIN, 60),
   },
 

@@ -21,7 +21,7 @@
 //   T9  deployed preview /api/suggest-replies → >=3 usable reply options
 //       (same E2E_PREVIEW_URL gating as T8)
 //
-// Baseline captured 2026-08-09 ~14:57Z (live Zoho inbox top-10).
+// Baseline captured 2026-08-09 ~15:25Z (live Zoho inbox top-10).
 //
 // Run:  node test/e2e-live.mjs      (or: npm run test:e2e)
 // Exit: 0 = all REQUIRED tests passed · 1 = a required test failed ·
@@ -45,25 +45,24 @@ const BASE = (process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1
 const MEDIA_URL = process.env.ONDEMAND_MEDIA_URL || 'https://api.on-demand.io/media/v1/public/file/raw';
 const KEY = process.env.ONDEMAND_API_KEY || '';
 
-// Live Zoho inbox baseline (captured 2026-08-09 ~14:57Z, newest first):
+// Live Zoho inbox baseline (captured 2026-08-09 ~15:25Z, newest first):
 // the fixed flow's output MUST contain this exact contiguous sequence,
 // optionally preceded only by STRICTLY NEWER mail (containment semantics).
 const BASELINE = [
-  '1786287423191141900', // ali alkorbi · "Re: Introduction to AIREV"
+  '1786287423191141900', // ali alkorbi <alialkorbi909090@gmail.com> · "Re: Introduction to AIREV"
   '1786286464610141300', // meera.aldhaheri@airev.ae · "Re: Introduction to AIREV"
   '1786286454401141900', // On-Demand · "OnDemand.io: Your live session update is ready"
   '1786281870421141900', // On-Demand · "Important: Token Usage Limit Reached for gemini-3.6-flash …"
   '1786277848903141900', // On-Demand · session update
-  '1786274767668141900', // On-Demand · token-limit gemini-3.6-flash
+  '1786274767668141900', // On-Demand · token limit gemini-3.6-flash
   '1786274208925141800', // Willy Liang Wei Min · "Airev x Presight alignment"
   '1786263130726141900', // On-Demand · session update
   '1786255553483141900', // On-Demand · session update
   '1786255198411141900', // On-Demand · session update
 ];
 // Tail context beyond the captured 10 (next expected ids when the window
-// extends): 1786252917214141900 session update, 1786252730712141900 session
-// update, 1786241360374141900 "Stock Analysis Report: AAPL, TSLA, and AMZN",
-// 1786229757846141900 Ali Zamiri "Accepted: MK x Ali catch up",
+// extends): 1786252917214141900, 1786252730712141900, 1786241360374141900
+// (Stock Analysis Report), 1786229757846141900 Ali Zamiri "Accepted",
 // 1786227643425141900 meeting-forward, 1786227470649141900 WHOOP.
 
 // Epoch-ms embedded in a Zoho messageId (first 13 digits).
@@ -439,7 +438,14 @@ await test('T8 deployed preview /api/dashboard/meera returns 200 with LIVE data'
   if (k === -1) throw new Error(`baseline head ${BASELINE[0]} not in preview recentEmails: ${JSON.stringify(got.slice(0, 12))}`);
   const fit = Math.min(BASELINE.length, got.length - k);
   assertBaselineContained(got.slice(0, k + fit), BASELINE.slice(0, fit));
-  return { status: 200, source: last.source, degraded: last.degraded, count: re.length, firstId: got[0], matchedBaseline: fit, newerPrefix: k, ordering: 'newest-first' };
+  // v38: FRESHNESS assertion — the served dashboard must be a RECENT build,
+  // not an aged lastGood snapshot. dataAsOf/dataAgeMs were added to every
+  // response; a non-degraded payload older than 30 minutes is a staleness
+  // regression even if its content happens to match the baseline.
+  const ageMs = last.dataAgeMs ?? (last.dataAsOf ? Date.now() - Date.parse(last.dataAsOf) : null);
+  if (ageMs == null) throw new Error('response carries no dataAsOf/dataAgeMs freshness stamp');
+  if (ageMs > 30 * 60 * 1000) throw new Error(`served dashboard is ${Math.round(ageMs / 60000)}min old — stale snapshot, not live data`);
+  return { status: 200, source: last.source, degraded: last.degraded, dataAgeMs: ageMs, count: re.length, firstId: got[0], matchedBaseline: fit, newerPrefix: k, ordering: 'newest-first' };
 });
 
 await test('T9 deployed preview /api/suggest-replies returns >=3 usable options', true, async () => {
