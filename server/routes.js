@@ -204,28 +204,12 @@ const emptyDashboardShape = (error = null) => ({
   threads: [], recentEmails: [],
 });
 const DASHBOARD_WARMUP_BUDGET_MS = Number(process.env.DASHBOARD_WARMUP_BUDGET_MS || (process.env.VERCEL ? 35000 : 45000));
-// v38 (staleness root-cause fix): FRESHNESS CEILING on the lastGood fallback.
-// The v36 route could serve the never-expiring `meera:lastGood` snapshot at
-// UNBOUNDED age during throttle/outage windows (audit finding d) — an
-// hours/days-old dashboard came back HTTP 200 ok:true forever. lastGood is
-// now served ONLY while younger than LASTGOOD_MAX_AGE_MS (default 6h); an
-// older snapshot is withheld and the route answers with the explicit empty
-// shape + error instead, so genuinely stale data can never masquerade as a
-// usable inbox. Every degraded response also carries dataAsOf/dataAgeMs so
-// clients and tests can bound freshness programmatically.
-const LASTGOOD_MAX_AGE_MS = Number(process.env.LASTGOOD_MAX_AGE_MS || 6 * 3600 * 1000);
+// v39 (LIVE-ONLY, supersedes the v38 6h lastGood age-ceiling): the lastGood
+// fallback is removed ENTIRELY — no snapshot of any age is ever served. Only
+// dataAsOf/dataAgeMs freshness metadata survives from v38.
 const dashAgeMs = (dash) => {
   const t = Date.parse(dash?.generatedAt || '');
   return Number.isFinite(t) ? Math.max(0, Date.now() - t) : null;
-};
-const freshLastGood = () => {
-  const lg = kv.get(NS.DASHBOARD, 'meera:lastGood'); // never-expiring snapshot
-  if (!lg) return { lastGood: null, withheld: false };
-  const age = dashAgeMs(lg);
-  if (age != null && age > LASTGOOD_MAX_AGE_MS) {
-    return { lastGood: null, withheld: true, withheldAgeMs: age };
-  }
-  return { lastGood: lg, withheld: false };
 };
 api.get('/dashboard/meera', async (req, res) => {
   const entry = kv.getEntry(NS.DASHBOARD, 'meera');
@@ -236,7 +220,12 @@ api.get('/dashboard/meera', async (req, res) => {
     }
     return res.json({ ok: true, source: 'cache', ageMs: entry.ageMs, lastUpdated: new Date(entry.storedAt).toISOString(), dataAsOf: entry.value.generatedAt, dataAgeMs: dashAgeMs(entry.value), degraded: false, dashboard: entry.value });
   }
-  const { lastGood, withheld, withheldAgeMs } = freshLastGood();
+  // v39 (LIVE-ONLY, supersedes the v38 6h age-ceiling): the never-expiring
+  // 'meera:lastGood' stale-snapshot fallback is REMOVED entirely — the
+  // dashboard must never render old cached emails at ANY age. On warm-up
+  // overrun or failure the route answers with an explicitly EMPTY
+  // (degraded-labelled) shape; the UI shows its warming/sync banner and the
+  // 60s poll picks up the live rebuild. Stale data is never served.
   const warmUp = (async () => {
     if (kv.keys(NS.EMAIL_META).length === 0) await syncInbox({});
     let d = await rebuildDashboard();
@@ -252,15 +241,13 @@ api.get('/dashboard/meera', async (req, res) => {
       new Promise((resolve) => { timer = setTimeout(() => resolve(BUDGET), DASHBOARD_WARMUP_BUDGET_MS); }),
     ]);
     if (raced === BUDGET) {
-      // warm-up still running — let it finish in the background and answer now.
+      // warm-up still running — let it finish in the background and answer now
+      // with an EMPTY live-only shape (never a stale snapshot).
       enqueue('rebuildDashboard', {}, { idempotencyKey: 'warmup-dashboard' });
-      const dash = lastGood || entry?.value || emptyDashboardShape(withheld
-        ? `warm-up in progress; lastGood snapshot withheld (age ${Math.round((withheldAgeMs || 0) / 60000)}min > ceiling ${Math.round(LASTGOOD_MAX_AGE_MS / 60000)}min)`
-        : 'warm-up in progress');
+      const dash = emptyDashboardShape('warm-up in progress');
       return res.json({
-        ok: true, source: lastGood ? 'lastGood-warming' : 'warming', degraded: true,
+        ok: true, source: 'warming', degraded: true,
         error: `live inbox warm-up exceeded ${DASHBOARD_WARMUP_BUDGET_MS}ms budget — background sync continues`,
-        ...(withheld ? { lastGoodWithheld: true, lastGoodAgeMs: withheldAgeMs } : {}),
         retryAfterMs: 15000, lastUpdated: dash.generatedAt, dataAsOf: dash.generatedAt, dataAgeMs: dashAgeMs(dash), dashboard: dash,
       });
     }
@@ -268,13 +255,12 @@ api.get('/dashboard/meera', async (req, res) => {
     const stillEmpty = isEmpty(dashboard);
     return res.json({ ok: true, source: stillEmpty ? 'empty-after-sync' : 'rebuilt', ageMs: 0, lastUpdated: dashboard.generatedAt, dataAsOf: dashboard.generatedAt, dataAgeMs: 0, degraded: stillEmpty, ...(stillEmpty ? { error: 'sync produced no threads (provider empty or misconfigured)' } : {}), dashboard });
   } catch (e) {
-    const dash = lastGood || emptyDashboardShape(withheld
-      ? `${String(e?.message || e)} — lastGood snapshot withheld (age ${Math.round((withheldAgeMs || 0) / 60000)}min > ceiling ${Math.round(LASTGOOD_MAX_AGE_MS / 60000)}min)`
-      : String(e?.message || e));
+    // v39: live-only — a failed sync answers with an explicitly empty shape,
+    // never a stale snapshot.
+    const dash = emptyDashboardShape(String(e?.message || e));
     return res.json({
-      ok: true, source: lastGood ? 'lastGood-fallback' : 'sync-error', degraded: true,
+      ok: true, source: 'sync-error', degraded: true,
       error: String(e?.message || e), retryAfterMs: 20000,
-      ...(withheld ? { lastGoodWithheld: true, lastGoodAgeMs: withheldAgeMs } : {}),
       lastUpdated: dash.generatedAt, dataAsOf: dash.generatedAt, dataAgeMs: dashAgeMs(dash), dashboard: dash,
     });
   } finally {
