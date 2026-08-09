@@ -46,7 +46,7 @@ const MEDIA_BASE_URL = process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-de
 const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 
 app.get('/api/health', (_req, res) => res.json({
-  ok: true, platform: 'vercel', version: 'v31', keyConfigured: odConfigured(),
+  ok: true, platform: 'vercel', version: 'v37', keyConfigured: odConfigured(),
   baseUrl: BASE_URL,                              // v30: /chat/v1-normalized base in effect
   draftEndpointId: DRAFT_ENDPOINT_ID, sendEndpointId: SEND_ENDPOINT_ID,
   mediaBaseUrl: MEDIA_BASE_URL, uploadRoute: true,
@@ -54,6 +54,18 @@ app.get('/api/health', (_req, res) => res.json({
   liveMailRoute: '/api/mail/fetch', docSelectRoute: '/api/documents/select', structuredSendRoute: '/api/send-structured',
   copilotSession: copilotSessionStatus(),        // v30: warm-session readiness
   envReconciliation,                              // v30: ON_DEMAND_*→ONDEMAND_* aliases fired
+  // v37: env-injection proof — which credentials/config are IN EFFECT
+  // (names and booleans only; never values).
+  agentIds: AGENT_IDS,
+  envSource: {
+    keyConfigured: odConfigured(),
+    keyFrom: process.env.ONDEMAND_API_KEY
+      ? (envReconciliation.aliased.some((a) => a.endsWith('→ONDEMAND_API_KEY')) ? 'alias:ON_DEMAND_API_KEY' : 'canonical:ONDEMAND_API_KEY')
+      : 'missing',
+    agentIdsFrom: process.env.ONDEMAND_AGENT_IDS ? 'env:ONDEMAND_AGENT_IDS' : 'default',
+    baseUrlNormalized: envReconciliation.baseUrlNormalized,
+    aliased: envReconciliation.aliased,
+  },
   ts: new Date().toISOString(),
 }));
 

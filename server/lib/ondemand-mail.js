@@ -329,12 +329,27 @@ async function _fetchRecentMailOnce({ lookbackDays = null, maxResults = null, ma
 
       const parsed = parseJsonIsland(r.answer);
       if (!Array.isArray(parsed)) {
-        if (MAIL_AGENT_CANDIDATES().length > 1) failedAgents.add(agentId);
+        // v37: ZOHO-RATE-LIMIT AWARENESS. When Zoho throttles the connector's
+        // listZohoEmails tool ("Access Denied - You have made too many
+        // requests continuously"), the model returns explanatory PROSE, which
+        // lands here as 'unparseable'. That is NOT an unhealthy agent and NOT
+        // a parse bug — wait out the per-minute window and retry the SAME
+        // agent instead of burning retries back-to-back.
+        const zohoThrottled = /access denied|too many requests|rate.?limit/i.test(String(r.answer || ''));
+        if (!zohoThrottled && MAIL_AGENT_CANDIDATES().length > 1) failedAgents.add(agentId);
         invalidateHealthyAgent();
-        attemptsLog.push({ attempt, agentId, outcome: 'unparseable' });
-        lastErr = Object.assign(new Error(`OnDemand mail agent did not return a JSON array (got: ${String(r.answer).slice(0, 160)}). NOT falling back to seed data.`), { code: 'MAIL_FETCH_UNPARSEABLE', status: 502, rawAnswer: String(r.answer).slice(0, 500) });
-        logger.warn('mail.fetch.unparseable', { attempt, agentId });
-        if (attempt < MAX_ATTEMPTS) { await _sleep(_backoffMs(attempt)); continue; }
+        attemptsLog.push({ attempt, agentId, outcome: zohoThrottled ? 'zoho-rate-limited' : 'unparseable' });
+        lastErr = Object.assign(new Error(zohoThrottled
+          ? `Zoho upstream rate-limited the connector's mail tool (transient). NOT falling back to seed data.`
+          : `OnDemand mail agent did not return a JSON array (got: ${String(r.answer).slice(0, 160)}). NOT falling back to seed data.`), {
+          code: zohoThrottled ? 'MAIL_FETCH_ZOHO_RATE_LIMITED' : 'MAIL_FETCH_UNPARSEABLE',
+          status: 502, rawAnswer: String(r.answer).slice(0, 500),
+        });
+        logger.warn(zohoThrottled ? 'mail.fetch.zohoRateLimited' : 'mail.fetch.unparseable', { attempt, agentId });
+        if (attempt < MAX_ATTEMPTS) {
+          await _sleep(zohoThrottled ? Number(process.env.MAIL_FETCH_ZOHO_BACKOFF_MS || 75000) : _backoffMs(attempt));
+          continue;
+        }
         break;
       }
 

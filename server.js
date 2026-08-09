@@ -98,7 +98,7 @@ const PORT = Number(process.env.PORT || 5173);
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'v31',
+    version: 'v37',
     keyConfigured: odConfigured(),               // v30: derive from live client (post env-reconciliation)
     baseUrl: BASE_URL,                           // v30: proves the /chat/v1-normalized base is in effect
     suggestRoute: true,
@@ -116,6 +116,18 @@ app.get('/api/health', (_req, res) => {
     structuredSendRoute: '/api/send-structured',
     copilotSession: copilotSessionStatus(),      // v30: warm-session readiness + reinit count
     envReconciliation,                            // v30: which ON_DEMAND_*→ONDEMAND_* aliases fired
+    // v37: env-injection proof — which credentials/config are IN EFFECT
+    // (names and booleans only; never values).
+    agentIds: AGENT_IDS,
+    envSource: {
+      keyConfigured: odConfigured(),
+      keyFrom: process.env.ONDEMAND_API_KEY
+        ? (envReconciliation.aliased.some((a) => a.endsWith('→ONDEMAND_API_KEY')) ? 'alias:ON_DEMAND_API_KEY' : 'canonical:ONDEMAND_API_KEY')
+        : 'missing',
+      agentIdsFrom: process.env.ONDEMAND_AGENT_IDS ? 'env:ONDEMAND_AGENT_IDS' : 'default',
+      baseUrlNormalized: envReconciliation.baseUrlNormalized,
+      aliased: envReconciliation.aliased,
+    },
     ts: new Date().toISOString(),
   });
 });

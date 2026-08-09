@@ -1,48 +1,49 @@
 {
-  "ranAt": "2026-08-09T12:11:06.606Z",
+  "ranAt": "2026-08-09T14:22:27.814Z",
   "base": "https://api.on-demand.io/chat/v1",
   "endpointId": "predefined-gemini-3.6-flash",
   "agentId": "agent-1784351533",
+  "previewUrl": "https://sb-38t5f6x7xlpb.vercel.run",
   "baseline": [
+    "1786281870421141900",
+    "1786277848903141900",
+    "1786274767668141900",
+    "1786274208925141800",
     "1786263130726141900",
     "1786255553483141900",
     "1786255198411141900",
     "1786252917214141900",
     "1786252730712141900",
-    "1786241360374141900",
-    "1786229757846141900",
-    "1786227643425141900",
-    "1786227470649141900",
-    "1786219120218141900"
+    "1786241360374141900"
   ],
   "results": [
     {
       "name": "T1 session.create agentIds=[agent-1784351533]",
       "required": true,
       "status": "PASS",
-      "startedAt": "2026-08-09T12:05:33.407Z",
-      "endedAt": "2026-08-09T12:05:33.636Z",
-      "ms": 229,
+      "startedAt": "2026-08-09T14:19:06.333Z",
+      "endedAt": "2026-08-09T14:19:06.575Z",
+      "ms": 242,
       "detail": {
         "status": 201,
-        "sessionId": "6a786d0d1d93d806b72a9a02"
+        "sessionId": "6a788c5ac54d7f4ff896eb49"
       }
     },
     {
       "name": "T2 query.sync recent emails via connector",
       "required": true,
       "status": "PASS",
-      "startedAt": "2026-08-09T12:05:33.636Z",
-      "endedAt": "2026-08-09T12:06:18.100Z",
-      "ms": 44464,
+      "startedAt": "2026-08-09T14:19:06.576Z",
+      "endedAt": "2026-08-09T14:19:39.541Z",
+      "ms": 32965,
       "detail": {
         "status": 200,
         "count": 15,
         "bareNumberIds": 0,
         "first3Ids": [
-          "1786274767668141900",
-          "1786274208925141800",
-          "1786263130726141900"
+          "1786281870421141900",
+          "1786277848903141900",
+          "1786274767668141900"
         ]
       }
     },
@@ -50,29 +51,28 @@
       "name": "T3 baseline containment + newest-first ordering",
       "required": true,
       "status": "PASS",
-      "startedAt": "2026-08-09T12:06:18.100Z",
-      "endedAt": "2026-08-09T12:06:52.589Z",
-      "ms": 34489,
+      "startedAt": "2026-08-09T14:19:39.541Z",
+      "endedAt": "2026-08-09T14:19:39.542Z",
+      "ms": 1,
       "detail": {
         "matched": 10,
-        "newerPrefix": 2,
-        "ordering": "newest-first",
-        "secondSample": true
+        "newerPrefix": 0,
+        "ordering": "newest-first"
       }
     },
     {
       "name": "T4 app fetchRecentMail() returns baseline newest-first",
       "required": true,
       "status": "PASS",
-      "startedAt": "2026-08-09T12:06:52.589Z",
-      "endedAt": "2026-08-09T12:07:30.295Z",
-      "ms": 37706,
+      "startedAt": "2026-08-09T14:19:39.542Z",
+      "endedAt": "2026-08-09T14:20:44.890Z",
+      "ms": 65348,
       "detail": {
         "count": 15,
-        "firstId": "1786274767668141900",
+        "firstId": "1786281870421141900",
         "agentId": "agent-1784351533",
         "matchedBaseline": 10,
-        "newerPrefix": 2,
+        "newerPrefix": 0,
         "ordering": "newest-first"
       }
     },
@@ -80,18 +80,18 @@
       "name": "T5 media upload with agents=[connector] (optional)",
       "required": false,
       "status": "FAIL",
-      "startedAt": "2026-08-09T12:07:30.295Z",
-      "endedAt": "2026-08-09T12:07:30.500Z",
-      "ms": 205,
+      "startedAt": "2026-08-09T14:20:44.890Z",
+      "endedAt": "2026-08-09T14:20:45.261Z",
+      "ms": 371,
       "error": "media upload HTTP 500: {\"message\":\"errors.no.executable.plugin.found\",\"errorCode\":\"server_error\"}"
     },
     {
       "name": "T6 no legacy IDs remain in codebase",
       "required": true,
       "status": "PASS",
-      "startedAt": "2026-08-09T12:07:30.500Z",
-      "endedAt": "2026-08-09T12:07:30.504Z",
-      "ms": 4,
+      "startedAt": "2026-08-09T14:20:45.261Z",
+      "endedAt": "2026-08-09T14:20:45.266Z",
+      "ms": 5,
       "detail": {
         "filesScanned": 42
       }
@@ -100,21 +100,53 @@
       "name": "T7 dashboard.recentEmails newest-first + baseline containment",
       "required": true,
       "status": "PASS",
-      "startedAt": "2026-08-09T12:07:30.504Z",
-      "endedAt": "2026-08-09T12:11:06.606Z",
-      "ms": 216102,
+      "startedAt": "2026-08-09T14:20:45.266Z",
+      "endedAt": "2026-08-09T14:22:07.904Z",
+      "ms": 82638,
       "detail": {
         "count": 20,
-        "firstId": "1786274767668141900",
+        "firstId": "1786281870421141900",
         "matchedBaseline": 10,
-        "newerPrefix": 2,
+        "newerPrefix": 0,
         "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T8 deployed preview /api/dashboard/meera returns 200 with LIVE data",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T14:22:07.904Z",
+      "endedAt": "2026-08-09T14:22:08.159Z",
+      "ms": 255,
+      "detail": {
+        "status": 200,
+        "source": "cache",
+        "degraded": false,
+        "count": 20,
+        "firstId": "1786281870421141900",
+        "matchedBaseline": 10,
+        "newerPrefix": 0,
+        "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T9 deployed preview /api/suggest-replies returns >=3 usable options",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T14:22:08.159Z",
+      "endedAt": "2026-08-09T14:22:27.814Z",
+      "ms": 19655,
+      "detail": {
+        "status": 200,
+        "source": "ondemand-live",
+        "count": 4,
+        "degraded": false
       }
     }
   ],
   "summary": {
-    "total": 7,
-    "passed": 6,
+    "total": 9,
+    "passed": 8,
     "failed": 1,
     "requiredFailed": 0
   }

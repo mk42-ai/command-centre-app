@@ -510,7 +510,14 @@ export async function rebuildDashboard() {
     threads,
   };
   kv.set(NS.DASHBOARD, 'meera', dashboard, CONFIG.cache.dashboardTtlS);
-  kv.set(NS.DASHBOARD, 'meera:lastGood', dashboard, 0); // never expires — sync-failure fallback
+  // v37 (T8 root-cause fix): NEVER clobber lastGood with an EMPTY rebuild.
+  // When EMAIL_META had expired and a background rebuild ran during a live-
+  // fetch outage, the empty dashboard overwrote the never-expiring lastGood
+  // snapshot — the UI then had NOTHING to fall back to (recentEmails=0).
+  // lastGood must only ever advance to a populated dashboard.
+  if (threads.length > 0) {
+    kv.set(NS.DASHBOARD, 'meera:lastGood', dashboard, 0); // never expires — sync-failure fallback
+  }
   return dashboard;
 }
 

@@ -16,6 +16,12 @@
 //   T6  static scan — zero legacy IDs anywhere in the repo
 //   T7  dashboard.recentEmails (server/functions/pipeline.js) is newest-first
 //       and contains the baseline via the same containment logic
+//   T8  deployed preview /api/dashboard/meera → 200 with LIVE data
+//       (polls E2E_PREVIEW_URL; PASSES as skipped when the URL is unset)
+//   T9  deployed preview /api/suggest-replies → >=3 usable reply options
+//       (same E2E_PREVIEW_URL gating as T8)
+//
+// Baseline captured 2026-08-09 ~13:25Z (live Zoho inbox top-10).
 //
 // Run:  node test/e2e-live.mjs      (or: npm run test:e2e)
 // Exit: 0 = all REQUIRED tests passed · 1 = a required test failed ·
@@ -39,21 +45,24 @@ const BASE = (process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1
 const MEDIA_URL = process.env.ONDEMAND_MEDIA_URL || 'https://api.on-demand.io/media/v1/public/file/raw';
 const KEY = process.env.ONDEMAND_API_KEY || '';
 
-// Live Zoho inbox baseline (captured 2026-08-09 ~10:20Z, newest first):
+// Live Zoho inbox baseline (captured 2026-08-09 ~13:25Z, newest first):
 // the fixed flow's output MUST contain this exact contiguous sequence,
 // optionally preceded only by STRICTLY NEWER mail (containment semantics).
 const BASELINE = [
-  '1786263130726141900', // On-Demand · "OnDemand.io: Your live session update is ready"
-  '1786255553483141900', // On-Demand · "OnDemand.io: Your live session update is ready"
-  '1786255198411141900', // On-Demand
-  '1786252917214141900', // On-Demand
-  '1786252730712141900', // On-Demand
+  '1786281870421141900', // On-Demand · "Important: Token Usage Limit Reached for gemini-3.6-flash …"
+  '1786277848903141900', // On-Demand · "OnDemand.io: Your live session update is ready"
+  '1786274767668141900', // On-Demand · "Important: Token Usage Limit Reached for gemini-3.6-flash …"
+  '1786274208925141800', // Willy Liang Wei Min · "Airev x Presight alignment"
+  '1786263130726141900', // On-Demand · session update
+  '1786255553483141900', // On-Demand · session update
+  '1786255198411141900', // On-Demand · session update
+  '1786252917214141900', // On-Demand · session update
+  '1786252730712141900', // On-Demand · session update
   '1786241360374141900', // on-demand · "Stock Analysis Report: AAPL, TSLA, and AMZN"
-  '1786229757846141900', // Ali Zamiri · "Accepted: MK x Ali catch up"
-  '1786227643425141900', // Ali Zamiri · "Meeting Forward Notification…"
-  '1786227470649141900', // WHOOP · "Your first Sleep Score is here"
-  '1786219120218141900', // On-Demand
 ];
+// Tail context beyond the captured 10 (next expected ids when the window
+// extends): 1786229757846141900 Ali Zamiri "Accepted: MK x Ali catch up",
+// 1786227643425141900 meeting-forward, 1786227470649141900 WHOOP.
 
 // Epoch-ms embedded in a Zoho messageId (first 13 digits).
 const epochOf = (id) => Number(String(id).slice(0, 13));
@@ -369,6 +378,93 @@ await test('T7 dashboard.recentEmails newest-first + baseline containment', true
   return { count: dash.recentEmails.length, firstId: got[0], matchedBaseline: fit, newerPrefix: k, ordering: 'newest-first' };
 });
 
+// ---------- preview-deployment tests (T8/T9) ----------
+// Validate the DEPLOYED preview read from E2E_PREVIEW_URL. Required tests,
+// but when E2E_PREVIEW_URL is unset they PASS as skipped (with a WARN) so
+// local runs without a deployment still work; CI sets the URL and genuinely
+// exercises them.
+const PREVIEW_URL = (process.env.E2E_PREVIEW_URL || '').replace(/\/+$/, '');
+
+await test('T8 deployed preview /api/dashboard/meera returns 200 with LIVE data', true, async () => {
+  if (!PREVIEW_URL) {
+    console.log(`[${new Date().toISOString()}] WARN T8 skipped — E2E_PREVIEW_URL not set`);
+    return { skipped: true, reason: 'E2E_PREVIEW_URL not set' };
+  }
+  // Poll until the warm-up completes: every poll that RETURNS must be HTTP
+  // 200 (the v36 route contract — never a 5xx); a TRANSIENT network abort/
+  // timeout is retried within the deadline (the tiny preview VM can be
+  // CPU-busy with background analysis jobs for tens of seconds — that is
+  // not a route failure). Test passes only when live data lands
+  // (source cache/rebuilt, degraded=false, >=10 recentEmails).
+  const deadline = Date.now() + 360000;
+  let last = null;
+  let netErrs = 0;
+  for (;;) {
+    const ac = new AbortController();
+    // 75s: must exceed the route's warm-up budget (DASHBOARD_WARMUP_BUDGET_MS,
+    // up to 45s local) — a poll issued right after cache expiry legitimately
+    // blocks for the full budget before the degraded 200 comes back.
+    const timer = setTimeout(() => ac.abort(), 75000);
+    let resp = null, j = null, netErr = null;
+    try {
+      resp = await fetch(`${PREVIEW_URL}/api/dashboard/meera`, { headers: { Accept: 'application/json' }, signal: ac.signal });
+      j = await resp.json().catch(() => null);
+    } catch (e) {
+      netErr = e;
+    } finally { clearTimeout(timer); }
+    if (netErr) {
+      netErrs += 1;
+      console.log(`[${new Date().toISOString()}] WARN T8 transient fetch error #${netErrs} (${String(netErr?.message || netErr).slice(0, 80)}) — retrying`);
+      if (netErrs > 6) throw new Error(`dashboard fetch failed ${netErrs} times: ${String(netErr?.message || netErr)}`);
+      if (Date.now() > deadline) throw new Error(`live data did not land within 360s (last error: ${String(netErr?.message || netErr).slice(0, 80)})`);
+      await new Promise((r) => setTimeout(r, 8000));
+      continue;
+    }
+    if (resp.status !== 200) throw new Error(`expected HTTP 200 on every poll, got ${resp.status}`);
+    if (!j?.ok) throw new Error(`ok!=true in dashboard response: ${JSON.stringify(j).slice(0, 160)}`);
+    last = j;
+    const re = j?.dashboard?.recentEmails || [];
+    if (!j.degraded && re.length >= 10) break;
+    if (Date.now() > deadline) throw new Error(`live data did not land within 360s (last source=${j.source}, degraded=${j.degraded}, recentEmails=${re.length})`);
+    await new Promise((r) => setTimeout(r, 10000));
+  }
+  const re = last.dashboard.recentEmails;
+  for (let i = 1; i < re.length; i++) {
+    if (!((re[i].receivedTime || 0) <= (re[i - 1].receivedTime || 0))) throw new Error(`preview recentEmails ordering violation at ${i}`);
+  }
+  const got = re.map((e) => String(e.messageId));
+  const k = got.indexOf(BASELINE[0]);
+  if (k === -1) throw new Error(`baseline head ${BASELINE[0]} not in preview recentEmails: ${JSON.stringify(got.slice(0, 12))}`);
+  const fit = Math.min(BASELINE.length, got.length - k);
+  assertBaselineContained(got.slice(0, k + fit), BASELINE.slice(0, fit));
+  return { status: 200, source: last.source, degraded: last.degraded, count: re.length, firstId: got[0], matchedBaseline: fit, newerPrefix: k, ordering: 'newest-first' };
+});
+
+await test('T9 deployed preview /api/suggest-replies returns >=3 usable options', true, async () => {
+  if (!PREVIEW_URL) {
+    console.log(`[${new Date().toISOString()}] WARN T9 skipped — E2E_PREVIEW_URL not set`);
+    return { skipped: true, reason: 'E2E_PREVIEW_URL not set' };
+  }
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 120000);
+  let resp, j;
+  try {
+    resp = await fetch(`${PREVIEW_URL}/api/suggest-replies`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread: { sender: 'Willy Liang Wei Min', email: 'willy@presight.ai', org: 'Presight', subject: 'Airev x Presight alignment', summary: 'Alignment call follow-up; they await a reply on next steps.' } }),
+    });
+    j = await resp.json().catch(() => null);
+  } catch (e) {
+    throw new Error(`suggest-replies fetch failed: ${e?.message || e}`);
+  } finally { clearTimeout(timer); }
+  if (resp.status !== 200) throw new Error(`expected HTTP 200, got ${resp.status}`);
+  if (!j?.ok || !Array.isArray(j.replies)) throw new Error(`bad shape: ${JSON.stringify(j).slice(0, 160)}`);
+  const usable = j.replies.map((s) => String(s || '').trim()).filter((s) => s.length >= 20);
+  if (usable.length < 3) throw new Error(`fewer than 3 usable options: ${usable.length} (source=${j.source})`);
+  return { status: 200, source: j.source, count: usable.length, degraded: Boolean(j.degraded) };
+});
+
 // ---------- summary + results file ----------
 const passed = results.filter((r) => r.status === 'PASS').length;
 const failed = results.filter((r) => r.status === 'FAIL').length;
@@ -380,6 +476,7 @@ fs.writeFileSync(path.join(HERE, 'e2e-results.json'), JSON.stringify({
   base: BASE,
   endpointId: ENDPOINT_ID,
   agentId: AGENT_ID,
+  previewUrl: PREVIEW_URL || null,
   baseline: BASELINE,
   results,
   summary,
