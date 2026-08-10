@@ -27,6 +27,8 @@ import {
 } from './functions/pipeline.js';
 // v31: live mail + file-directory orchestration (fixes #1 fetch, #2 send, #3 attach)
 import { fetchRecentMail, listCompanyFiles, selectRelevantDocument, sendViaOnDemandAgent, lastSuccessfulSync } from './lib/ondemand-mail.js';
+// v45: pure never-5xx dashboard response contract (unit-tested).
+import { degradedDashboardResponse, retryAfterSeconds, isEmptyDashboard, hotWindowFresh, backoffRetryMs, emptyDashboard } from './lib/dashboard-contract.js';
 import { buildStructuredEmailHtml } from './lib/mail.js';
 
 export const api = Router();
@@ -215,19 +217,24 @@ const dashAgeMs = (dash) => {
   const t = Date.parse(dash?.generatedAt || '');
   return Number.isFinite(t) ? Math.max(0, Date.now() - t) : null;
 };
+// v45: consecutive upstream-failure counter → exponential retryAfterMs hint
+// (15s→30s→60s→120s→240s, capped 5min) so the UI backs off during Zoho
+// rate-limit windows instead of hammering a struggling upstream every 60s.
+let dashConsecutiveFailures = 0;
 api.get('/dashboard/meera', async (req, res) => {
   const entry = kv.getEntry(NS.DASHBOARD, 'meera');
-  const isEmpty = (d) => !d || !Array.isArray(d.threads) || d.threads.length === 0;
+  const isEmpty = isEmptyDashboard;
   // v40 LIVE-ONLY hot window: serve the just-built dashboard from process
   // memory only while it is provably fresh (age <= HOT_WINDOW_MAX_MS AND its
   // own generatedAt agrees); label it 'live' — the old 'cache' label read as
   // "cached state" in the UI and hid how fresh the data actually was.
   if (entry && !isEmpty(entry.value)) {
     const age = dashAgeMs(entry.value);
-    if (entry.ageMs <= HOT_WINDOW_MAX_MS && age != null && age <= HOT_WINDOW_MAX_MS) {
+    if (hotWindowFresh(entry.ageMs, age, HOT_WINDOW_MAX_MS)) {
       if (entry.ageMs > (CONFIG.cache.dashboardTtlS * 1000) / 2) {
         enqueue('rebuildDashboard', {}, { idempotencyKey: 'swr-dashboard' });
       }
+      dashConsecutiveFailures = 0;
       return res.json({ ok: true, source: 'live', ageMs: entry.ageMs, lastUpdated: new Date(entry.storedAt).toISOString(), dataAsOf: entry.value.generatedAt, dataAgeMs: age, degraded: false, dashboard: entry.value });
     }
     // hot window exceeded → fall through to a LIVE rebuild (never serve it)
@@ -251,27 +258,36 @@ api.get('/dashboard/meera', async (req, res) => {
     ]);
     if (raced === BUDGET) {
       // warm-up still running — let it finish in the background and answer now
-      // with an EMPTY live-only shape (never a stale snapshot).
+      // with an EMPTY live-only shape (never a stale snapshot). v45: exponential
+      // retryAfterMs + Retry-After header so clients back off during rate-limit windows.
       enqueue('rebuildDashboard', {}, { idempotencyKey: 'warmup-dashboard' });
-      const dash = emptyDashboardShape('warm-up in progress');
-      return res.json({
-        ok: true, source: 'warming', degraded: true,
-        error: `live inbox warm-up exceeded ${DASHBOARD_WARMUP_BUDGET_MS}ms budget — background sync continues`,
-        retryAfterMs: 15000, lastUpdated: dash.generatedAt, dataAsOf: dash.generatedAt, dataAgeMs: dashAgeMs(dash), dashboard: dash,
-      });
+      dashConsecutiveFailures += 1;
+      const retryMs = backoffRetryMs(dashConsecutiveFailures);
+      const body = degradedDashboardResponse(
+        'warming',
+        `live inbox warm-up exceeded ${DASHBOARD_WARMUP_BUDGET_MS}ms budget — background sync continues`,
+        emptyDashboardShape('warm-up in progress'),
+        retryMs,
+      );
+      res.set('Retry-After', retryAfterSeconds(retryMs));
+      return res.status(200).json(body);
     }
     const dashboard = raced;
     const stillEmpty = isEmpty(dashboard);
+    if (!stillEmpty) dashConsecutiveFailures = 0;
     return res.json({ ok: true, source: stillEmpty ? 'empty-after-sync' : 'rebuilt', ageMs: 0, lastUpdated: dashboard.generatedAt, dataAsOf: dashboard.generatedAt, dataAgeMs: 0, degraded: stillEmpty, ...(stillEmpty ? { error: 'sync produced no threads (provider empty or misconfigured)' } : {}), dashboard });
   } catch (e) {
     // v39: live-only — a failed sync answers with an explicitly empty shape,
-    // never a stale snapshot.
-    const dash = emptyDashboardShape(String(e?.message || e));
-    return res.json({
-      ok: true, source: 'sync-error', degraded: true,
-      error: String(e?.message || e), retryAfterMs: 20000,
-      lastUpdated: dash.generatedAt, dataAsOf: dash.generatedAt, dataAgeMs: dashAgeMs(dash), dashboard: dash,
-    });
+    // never a stale snapshot. v45: NEVER a 5xx — pure contract helper builds
+    // the degraded body with exponential retryAfterMs backoff.
+    dashConsecutiveFailures += 1;
+    const retryMs = backoffRetryMs(dashConsecutiveFailures);
+    let dash;
+    try { dash = emptyDashboardShape(String(e?.message || e)); }
+    catch { dash = emptyDashboard(CONFIG?.mail?.mailbox, null, String(e?.message || e)); }
+    const body = degradedDashboardResponse('sync-error', String(e?.message || e), dash, retryMs);
+    res.set('Retry-After', retryAfterSeconds(retryMs));
+    return res.status(200).json(body);
   } finally {
     if (timer) clearTimeout(timer);
   }

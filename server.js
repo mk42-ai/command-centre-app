@@ -7,6 +7,7 @@
 import './server/lib/env.js'; // v25: load .env (gitignored) before anything reads keys
 import express from 'express';
 import path from 'node:path';
+import fs from 'node:fs';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 // v19: OnDemand serverless backend layer — cache-first API, Zoho mail
@@ -25,6 +26,8 @@ import { buildSuggestPrompt, parseReplyShapes, RETRY_PROMPT as SUGGEST_RETRY_PRO
 import { warmupCopilotSession, ensureCopilotSession, reinitCopilotSession, copilotSessionStatus } from './server/lib/session.js';
 import { envReconciliation } from './server/lib/env.js';
 import { sendMailDirect } from './server/lib/mail.js';
+// v45: pure never-5xx dashboard degraded contract (shared with routes.js).
+import { degradedDashboardResponse as dcDegradedResponse, retryAfterSeconds as dcRetryAfterSeconds } from './server/lib/dashboard-contract.js';
 import { mergeRecords as wfMergeRecords, pollWorkflowOnce as wfPollOnce, ingestState as wfIngestState, WF_CONFIG } from './server/lib/workflow-ingest.js';
 import { logger, requestLogger } from './server/lib/logger.js';
 import { validateEnv } from './server/lib/validate-env.js';
@@ -548,6 +551,21 @@ app.use('/api', backendApi);
 // v25 (BE-05): unknown /api/* must be a JSON 404, never the SPA index.html
 app.all('/api/*', (_req, res) => res.status(404).json({ error: 'unknown API route' }));
 
+// v45 SAFETY NET: if any exception ever escapes an /api route (sync throw in
+// middleware, a future edit dropping a try/catch), answer JSON — and for the
+// dashboard route specifically, uphold the never-5xx degraded contract so the
+// UI's sync banner gets a parseable body instead of Express's HTML 500 page.
+app.use('/api', (err, req, res, _next) => {
+  if (res.headersSent) return;
+  const msg = String(err?.message || err);
+  console.error(`[v45] /api error safety net: ${req.method} ${req.path} — ${msg}`);
+  if (/^\/dashboard\//.test(req.path)) {
+    res.set('Retry-After', dcRetryAfterSeconds(20000));
+    return res.status(200).json(dcDegradedResponse('route-error', msg, null, 20000));
+  }
+  res.status(502).json({ ok: false, error: 'internal route error', detail: msg });
+});
+
 // ---------- cron schedules (OnDemand serverless runtime, UTC) ----------
 registerCron('inboxSync', CONFIG.cron.inboxSync, () => syncInbox({}), 'Incremental Zoho inbox sync (new/changed threads only)');
 registerCron('priorityRefresh', CONFIG.cron.priorityRefresh, async () => { await detectFollowups(); await rebuildDashboard(); }, 'Hourly priority pyramid + dashboard refresh');
@@ -556,9 +574,28 @@ registerCron('weeklyCleanup', CONFIG.cron.weeklyCleanup, () => refreshCache({ de
 registerCron('workflowMailIngest', `*/${WF_CONFIG.pollMinutes} * * * *`, () => wfPollOnce(), 'v25: ingest 15-min Zoho mail pulls from workflow 6a48a683 (dataset source, messageId dedupe)');
 
 // ---------- static app (built by Vite) ----------
+// v45 ROOT-CAUSE FIX: the previous catch-all had NO sendFile error callback,
+// so a deploy without a built dist/ (v44 tarball excluded dist and the sandbox
+// never ran `vite build`) threw ENOENT into Express's default HTML error
+// handler on EVERY page load — the UI shell 404'd/500'd and the app showed its
+// generic "sync issue — HTTP 500" banner. Now: loud boot-time check + a JSON
+// 503 with a clear message if the bundle is genuinely missing.
 const dist = path.join(__dirname, 'dist');
+const distIndex = path.join(dist, 'index.html');
+if (!fs.existsSync(distIndex)) {
+  console.error(`[v45] FATAL-ish: SPA bundle missing at ${distIndex} — run 'npm run build' (vite build) before/at deploy. API routes still serve; page loads will 503.`);
+}
 app.use(express.static(dist, { index: 'index.html', maxAge: '1h' }));
-app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
+app.get('*', (_req, res) => {
+  res.sendFile(distIndex, (err) => {
+    if (err && !res.headersSent) {
+      res.status(503).json({
+        ok: false, error: 'SPA bundle missing (dist/index.html not found on this deployment)',
+        hint: "run 'npm run build' during deploy — API routes are unaffected", detail: String(err.code || err.message || err),
+      });
+    }
+  });
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Meera's Command Centre v30 listening on 0.0.0.0:${PORT} — key configured: ${odConfigured()} — base: ${BASE_URL}`);
