@@ -4,7 +4,8 @@ import { toast } from 'sonner';
 import { motion, useReducedMotion } from 'framer-motion';
 import { generateRepliesParallel, refineReply, reviseReplyFreeform, matchDoc, DOCS, MICRO_COMMANDS, sendReply, uploadAttachment, loadSendLog, appendSendLog, DISMISS_OPTIONS, CURRENT_USER, recordDismissal, undoDismissal, loadDismissals } from './ai.js';
 // v43: pure, unit-tested state helpers — the selectability fix lives here.
-import { commitRevision, revisionCommittedState } from './workbenchState.js';
+// v44: applied-command indicator helpers — refining→applied badge per option.
+import { commitRevision, revisionCommittedState, beginRevisionIndicator, commitRevisionIndicator, failRevisionIndicator, resetRevisionIndicators, indicatorFor } from './workbenchState.js';
 import Badge, { toneForScore } from './Badge.jsx';
 import Icon from './Icon.jsx';
 
@@ -16,11 +17,26 @@ import Icon from './Icon.jsx';
  *  · dismiss to MK/SK/MA handler attribution, collapsible Resolved strip
  */
 
-function ReplyCard({ idx, text, selected, onSelect, revising, revealText }) {
+function ReplyCard({ idx, text, selected, onSelect, revising, revealText, indicator }) {
   // revising: skeleton phase (in-card). revealText: chunked word-streaming phase.
+  // indicator (v44): {command,state:'refining'|'applied'} — which micro-command
+  // (preset chip OR free-form custom text) produced/is producing this option text.
   return (
     <button className={`wb-reply ${selected ? 'sel' : ''}`} onClick={() => onSelect(idx)} title="Select this reply">
-      <div className="wb-reply-tag">Option {idx + 1}{selected ? ' · selected' : ''}</div>
+      <div className="wb-reply-tag">
+        Option {idx + 1}{selected ? ' · selected' : ''}
+        {indicator && (
+          <span
+            className={`wb-applied-cmd ${indicator.state}`}
+            data-cmd={indicator.command}
+            data-state={indicator.state}
+            title={indicator.state === 'applied' ? `Revised with: ${indicator.command}` : `Applying: ${indicator.command}…`}
+          >
+            {indicator.state === 'refining' ? <span className="wb-applied-spin" aria-hidden="true" /> : <Icon name="check" size={10} />}
+            {indicator.command}
+          </span>
+        )}
+      </div>
       {revising ? (
         <div className="wb-card-skel" aria-label="Revising draft">
           <div className="skel skel-line" />
@@ -75,6 +91,8 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
   const [sendState, setSendState] = useState(null);       // null | 'sending' | {ok,ts,...}
   const [sendLog, setSendLog] = useState(() => (loadSendLog()[thread.id] || []));
   const [dismissOpen, setDismissOpen] = useState(false); // compact 3-option selector
+  // v44: per-option applied-command indicator map — {idx: {command, state:'refining'|'applied'}}.
+  const [cmdIndicators, setCmdIndicators] = useState(() => resetRevisionIndicators());
   const busyRef = useRef(false);
 
   const doc = useMemo(() => matchDoc(thread), [thread]);
@@ -139,6 +157,7 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
         selectedDocs // every selected document is referenced in the drafting prompt
       );
       setReplies(arr); setSelIdx(0); setPhase('ready');
+      setCmdIndicators(resetRevisionIndicators()); // v44: fresh options carry no applied-command badges
       // v29: degraded-mode notice — fallback drafts still render, with a banner
       if (arr.__degraded) setErr(`Live AI unavailable (${String(arr.__degraded).slice(0, 80)}) — showing standby drafts; retry for live generation.`);
     } catch (e) {
@@ -156,6 +175,10 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
     if (!c || busyRef.current || !replies) return;
     busyRef.current = true;
     setCmdErr(''); setErr(''); setPhase('refining');
+    // v44: show the in-flight badge with the EXACT typed command text —
+    // identical path for preset chips and free-form custom commands.
+    const prevIndicator = indicatorFor(cmdIndicators, selIdx);
+    setCmdIndicators((ind) => beginRevisionIndicator(ind, selIdx, c));
     try {
       const revised = freeform
         ? await reviseReplyFreeform(thread, replies[selIdx], c)
@@ -171,12 +194,17 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
       const committed = revisionCommittedState();
       setPhase(committed.phase);
       busyRef.current = committed.busy;
+      // v44: flip the badge to 'applied' in the SAME synchronous commit as the
+      // revised text — the reveal below stays purely cosmetic.
+      setCmdIndicators((ind) => commitRevisionIndicator(ind, selIdx, c));
       runWordStream(revised, () => { /* cosmetic reveal only — state already committed */ });
     } catch (e) {
       toast.error('Revision failed', { description: String(e.message || e).slice(0, 120) });
       setErr(`Revision failed (${String(e.message || e)}).`);
       setPhase('ready');
       busyRef.current = false;
+      // v44: drop the in-flight badge; restore the previously applied one (if any).
+      setCmdIndicators((ind) => failRevisionIndicator(ind, selIdx, prevIndicator));
     }
   };
   const applyCmd = (chip) => applyRevision(chip, false);
@@ -324,6 +352,7 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
                 onSelect={setSelIdx}
                 revising={phase === 'refining' && i === selIdx && revealText == null}
                 revealText={i === selIdx ? revealText : null}
+                indicator={indicatorFor(cmdIndicators, i)}
               />
             ))}
           </div>

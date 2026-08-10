@@ -28,6 +28,55 @@ export function revisionCommittedState() {
   return { phase: 'ready', busy: false };
 }
 
+// ------------------------------------------------------------
+// v44 — applied-command indicator (pure, per-option-index map).
+//
+// Shape: { [optionIdx]: { command: '<exact typed text>', state: 'refining'|'applied' } }
+// The SAME helpers drive both the six preset chips and free-form
+// custom commands, guaranteeing preset/custom parity by construction.
+// 'refining' is set the moment a revision is dispatched; 'applied'
+// is committed SYNCHRONOUSLY together with commitRevision (never
+// inside the cosmetic word-reveal callback). On failure the entry
+// reverts to whatever was previously applied (or disappears).
+// ------------------------------------------------------------
+
+/** Mark option `idx` as being revised by `command` (immutable). */
+export function beginRevisionIndicator(indicators, idx, command) {
+  const cmd = String(command || '').trim();
+  if (!cmd) return indicators || {};
+  return { ...(indicators || {}), [idx]: { command: cmd, state: 'refining' } };
+}
+
+/** Commit option `idx` as revised-by-`command` (immutable). Call
+ *  synchronously alongside commitRevision — the badge flips to its
+ *  confirmed 'applied' state in the SAME render as the new text. */
+export function commitRevisionIndicator(indicators, idx, command) {
+  const cmd = String(command || '').trim();
+  if (!cmd) return indicators || {};
+  return { ...(indicators || {}), [idx]: { command: cmd, state: 'applied' } };
+}
+
+/** Revision failed / was abandoned: restore the previously-applied badge
+ *  for `idx` (if any) or drop the in-flight entry entirely (immutable). */
+export function failRevisionIndicator(indicators, idx, previousApplied = null) {
+  const next = { ...(indicators || {}) };
+  if (previousApplied && previousApplied.state === 'applied') next[idx] = previousApplied;
+  else delete next[idx];
+  return next;
+}
+
+/** Fresh generation wipes every applied-command badge. */
+export function resetRevisionIndicators() {
+  return {};
+}
+
+/** Badge lookup for a card: {command,state} or null. */
+export function indicatorFor(indicators, idx) {
+  const e = (indicators || {})[idx];
+  if (!e || !e.command) return null;
+  return e.state === 'refining' || e.state === 'applied' ? e : null;
+}
+
 /** An option is selectable whenever options exist and none is mid-refine. */
 export function isOptionSelectable(phase, replies, idx) {
   return Boolean(Array.isArray(replies) && replies[idx] && String(replies[idx]).trim().length >= 20 && phase !== 'generating');

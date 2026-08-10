@@ -951,3 +951,10 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 .wb-attach-chip.upload { border-style: dashed; opacity: .92; }
 .wb-attach-chip.up.on { border-color: var(--brand, #0B3D2E); }
 .wb-spinner.sm { width: 10px; height: 10px; border-width: 2px; display: inline-block; }
+
+/* v44 — applied-command badge (refining → applied) on reply option cards */
+.wb-applied-cmd { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 800; text-transform: none; letter-spacing: 0.02em; vertical-align: middle; }
+.wb-applied-cmd.refining { background: var(--tint); border: 1px dashed var(--brand-300, #9fc4ae); color: var(--brand-500); }
+.wb-applied-cmd.applied { background: var(--brand); border: 1px solid var(--brand); color: #fff; }
+.wb-applied-spin { width: 9px; height: 9px; border: 2px solid var(--brand-300, #9fc4ae); border-top-color: var(--brand); border-radius: 50%; animation: wb-spin 0.7s linear infinite; display: inline-block; }
+@keyframes wb-spin { to { transform: rotate(360deg); } }
