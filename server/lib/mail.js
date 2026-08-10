@@ -381,13 +381,11 @@ export async function getMailProvider() {
 
   // Explicit seed demo mode (opt-in only).
   if (forced === 'seed') {
-    if (!CONFIG.allowSeedFallback && process.env.MAIL_PROVIDER !== 'seed') {
-      throw new Error('[mail] seed provider is disabled. Set MAIL_PROVIDER=seed explicitly (demo only).');
-    }
-    console.warn('[mail] MAIL_PROVIDER=seed — replaying STATIC fixture (NOT live mail). Demo mode only.');
-    const dataMod = await import('../../src/data.js');
-    _provider = SeedProvider.fromDataModule(dataMod);
-    return _provider;
+    // v41 (LIVE-ONLY): the July-2026 THREADS fixture has been DELETED from
+    // src/data.js, so seed replay no longer has any data to replay. The
+    // explicit MAIL_PROVIDER=seed opt-in now fails fast instead of serving
+    // an empty (or resurrected) fixture.
+    throw new Error('[mail] seed provider is RETIRED (v41 live-only): the embedded fixture was removed from the bundle. Configure ONDEMAND_API_KEY for live mail.');
   }
 
   // Explicit Zoho REST mode.

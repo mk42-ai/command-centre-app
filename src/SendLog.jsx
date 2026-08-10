@@ -1,15 +1,19 @@
 import React, { useMemo } from 'react';
-import { THREADS } from './data.js';
+import { liveThreadsOf } from './liveModel.js';
 import { loadSendLog, loadHandledLog } from './ai.js';
 import Icon from './Icon.jsx';
 
 /*
- * Send Log section (v10) — aggregated, timestamped view of every dispatch
- * recorded per thread in localStorage (written by the Send via Fable flow).
+ * Send Log section (v10 / v41 live-only) — aggregated, timestamped view of
+ * every dispatch recorded per thread in localStorage (written by the send
+ * flow). v41: thread subjects/orgs are resolved against the LIVE dashboard
+ * threads (prop `d`) — the July fixture lookup is gone; unmatched ids
+ * degrade to "Thread <id>" instead of fixture content.
  */
 
-export default function SendLog() {
+export default function SendLog({ d = null }) {
   const entries = useMemo(() => {
+    const THREADS = liveThreadsOf(d);
     const log = loadSendLog();
     const rows = [];
     for (const [threadId, arr] of Object.entries(log)) {
@@ -28,7 +32,7 @@ export default function SendLog() {
     }
     rows.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
     return rows;
-  }, []);
+  }, [d]);
 
   return (
     <div className="card">

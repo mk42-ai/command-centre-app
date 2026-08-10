@@ -21,7 +21,7 @@
 //   T9  deployed preview /api/suggest-replies → >=3 usable reply options
 //       (same E2E_PREVIEW_URL gating as T8)
 //
-// Baseline captured 2026-08-09 ~22:16Z (live Zoho inbox top-10).
+// Baseline captured 2026-08-09 ~00:36Z (2026-08-10) (live Zoho inbox top-10).
 //
 // Run:  node test/e2e-live.mjs      (or: npm run test:e2e)
 // Exit: 0 = all REQUIRED tests passed · 1 = a required test failed ·
@@ -45,20 +45,20 @@ const BASE = (process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1
 const MEDIA_URL = process.env.ONDEMAND_MEDIA_URL || 'https://api.on-demand.io/media/v1/public/file/raw';
 const KEY = process.env.ONDEMAND_API_KEY || '';
 
-// Live Zoho inbox baseline (captured 2026-08-09 ~22:16Z, newest first):
+// Live Zoho inbox baseline (captured 2026-08-09 ~00:36Z (2026-08-10), newest first):
 // the fixed flow's output MUST contain this exact contiguous sequence,
 // optionally preceded only by STRICTLY NEWER mail (containment semantics).
 const BASELINE = [
+  '1786317343766141900', // noreply@github.com · "[GitHub] Your personal access token (classic) is abo"
+  '1786317267535141900', // noreply@github.com · "[GitHub] Your personal access token (classic) is abo"
+  '1786315699768141900', // no-reply@on-demand.io · "OnDemand.io: Your live session update is ready"
+  '1786313934664141900', // reply@official.whoop.com · "Get the most out of your workouts"
   '1786301689898141900', // no-reply@on-demand.io · "Important: Token Usage Limit Reached for gemini-3.6-"
   '1786300619095142000', // malloz@trade.gov.ae · "AIREV & Qualcomm"
   '1786297639485141900', // no-reply@on-demand.io · "OnDemand.io: Your live session update is ready"
   '1786297374746141900', // no-reply@on-demand.io · "Important: Token Usage Limit Reached for gemini-3.6-"
   '1786295543870141901', // no-reply@on-demand.io · "OnDemand.io: Your live session update is ready"
   '1786295302980141900', // no-reply@on-demand.io · "OnDemand.io: Your live session update is ready"
-  '1786295144523141900', // no-reply@on-demand.io · "OnDemand.io: Your live session update is ready"
-  '1786294972051141900', // no-reply@on-demand.io · "Important: Token Usage Limit Reached for gemini-3.6-"
-  '1786294881860141900', // no-reply@on-demand.io · "OnDemand.io: Your live session update is ready"
-  '1786294706576141900', // no-reply@on-demand.io · "OnDemand.io: Your live session update is ready"
 ];
 // Tail context beyond the captured 10 (next expected ids when the window
 // extends): 1786252917214141900, 1786252730712141900, 1786241360374141900
