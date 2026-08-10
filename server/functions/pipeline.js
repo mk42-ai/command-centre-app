@@ -45,7 +45,15 @@ function putSyncState(s) { kv.set(NS.SYNC_STATE, 'inbox', s, 0); }
 export async function syncInbox({ force = false, maxResults = 100 } = {}) {
   const provider = await getMailProvider();
   const state = getSyncState();
-  const after = force ? null : (state.lastInternalDate || null);
+  // v38: ALWAYS fetch the FULL lookback window. The old incremental narrowing
+  // (afterEpochMs = lastInternalDate) meant a later sync fetched ONLY mail
+  // newer than the last sync — so once an EMAIL_META entry expired it could
+  // NEVER be re-fetched (the decay's second leg). The OnDemand connector
+  // fetches a whole lookback window in one query regardless (afterEpochMs
+  // was ceil'd to >=1 day anyway), so incremental narrowing saved nothing
+  // while silently starving the cache. Full-window + checksum skip keeps
+  // idempotency; force still bypasses the analysis skip.
+  const after = null;
 
   let messages;
   try {
@@ -61,13 +69,16 @@ export async function syncInbox({ force = false, maxResults = 100 } = {}) {
     const csum = messageChecksum(m);
     const prev = state.processed[m.id];
     state.counts.totalSeen++;
-    if (prev && prev.checksum === csum && !force) { state.counts.skipped++; continue; } // idempotent skip
-    state.processed[m.id] = { checksum: csum, threadId: m.threadId, at: Date.now() };
-    newOrChanged.push({ m, csum, changed: Boolean(prev) });
-    // email metadata cache — the dashboard's raw source.
-    // v31 (FIX #1): SHORT TTL (CONFIG.mail.fetchTtlS, default 3 min) instead of
-    // the old 24h (defaultTtlS*4) so fresh inbox mail is never masked by a
-    // day-old cached copy. Also persists the full `body` from the live fetch.
+    // v38 (STALE-DECAY ROOT-CAUSE FIX): ALWAYS (re)write the EMAIL_META cache
+    // entry for EVERY message the provider returns — BEFORE the idempotent
+    // skip. Previously the checksum-skip fired first, so an UNCHANGED
+    // message's cache entry was written exactly once and expired fetchTtlS
+    // later, never to be refreshed (state.processed is not TTL'd, so every
+    // later sync skipped the re-write). rebuildDashboard() reads
+    // kv.all(EMAIL_META), so threads/recentEmails silently DECAYED between
+    // syncs (observed live on the preview: 20 → 6 entries in ~40 min).
+    // Re-setting on every sync renews the TTL, so an entry now only expires
+    // when the provider genuinely stops returning that message.
     kv.set(NS.EMAIL_META, m.id, {
       id: m.id, threadId: m.threadId, historyId: m.historyId,
       subject: headerValue(m, 'Subject'), from: parseAddress(headerValue(m, 'From')),
@@ -79,6 +90,11 @@ export async function syncInbox({ force = false, maxResults = 100 } = {}) {
       cachedAt: nowIso(),
     }, CONFIG.mail.fetchTtlS || CONFIG.cache.defaultTtlS);
     state.lastInternalDate = Math.max(state.lastInternalDate || 0, Number(m.internalDate) || 0);
+    // idempotent ANALYSIS skip — unchanged messages skip re-analysis only;
+    // their cache entry above is always refreshed.
+    if (prev && prev.checksum === csum && !force) { state.counts.skipped++; continue; }
+    state.processed[m.id] = { checksum: csum, threadId: m.threadId, at: Date.now() };
+    newOrChanged.push({ m, csum, changed: Boolean(prev) });
   }
 
   // cap processed-map growth (keep newest 2000 message states)
@@ -459,6 +475,28 @@ export async function rebuildDashboard() {
   }
   threads.sort((a, b) => a.tier - b.tier || b.urgency - a.urgency);
 
+  // v36: recent-emails view — EXACT newest-first inbox order by receivedTime
+  // (the dashboard's thread list is tier-sorted, which scrambles recency; the
+  // UI's Recent Emails panel needs the true inbox order, newest first, keyed
+  // by the REAL Zoho messageId so it can be validated against the live API).
+  const recentEmails = emails
+    .map((e) => {
+      const midMs = /^\d{13}/.test(String(e.id)) ? Number(String(e.id).slice(0, 13)) : null;
+      const ms = Number(e.internalDate) || midMs || 0;
+      return {
+        messageId: String(e.id),
+        sender: e.from?.name || e.from?.email || 'unknown',
+        email: e.from?.email || null,
+        subject: e.subject || '(no subject)',
+        receivedTime: ms,
+        receivedAt: ms ? new Date(ms).toISOString() : null,
+        snippet: String(e.snippet || e.body || '').slice(0, 160),
+        threadId: e.threadId,
+      };
+    })
+    .sort((a, b) => (b.receivedTime || 0) - (a.receivedTime || 0))
+    .slice(0, 20);
+
   const tierCounts = {};
   for (const t of threads) tierCounts[t.tier] = (tierCounts[t.tier] || 0) + 1;
 
@@ -471,6 +509,7 @@ export async function rebuildDashboard() {
     tierCounts,
     priorityPyramid: [1, 2, 3, 4, 5].map((tier) => ({ tier, count: tierCounts[tier] || 0, threads: threads.filter((t) => t.tier === tier).map((t) => t.threadId) })),
     topUrgent: threads.filter((t) => t.tier <= 2).slice(0, 8),
+    recentEmails,
     stalledThreads: fu.followups.slice(0, 10),
     whoOwesNext: {
       us: fu.followups.filter((f) => f.owesNext === 'us').map((f) => ({ threadId: f.threadId, subject: f.subject, daysQuiet: f.daysQuiet })),
@@ -487,7 +526,11 @@ export async function rebuildDashboard() {
     threads,
   };
   kv.set(NS.DASHBOARD, 'meera', dashboard, CONFIG.cache.dashboardTtlS);
-  kv.set(NS.DASHBOARD, 'meera:lastGood', dashboard, 0); // never expires — sync-failure fallback
+  // v39 (LIVE-ONLY): the never-expiring 'meera:lastGood' snapshot is RETIRED —
+  // the dashboard route no longer serves stale fallbacks, so persisting one
+  // would only risk old cached emails leaking back. Any previously persisted
+  // snapshot is actively deleted so stale data cannot survive in .data/.
+  kv.del(NS.DASHBOARD, 'meera:lastGood');
   return dashboard;
 }
 

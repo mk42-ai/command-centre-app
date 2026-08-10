@@ -17,15 +17,15 @@ export const CONFIG = {
   ondemand: {
     baseUrl: process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1',
     apiKey: process.env.ONDEMAND_API_KEY || '',
-    // v21: all model stages default to Claude Sonnet 5
-    draftEndpointId: process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5',
-    sendEndpointId: process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5',
-    analysisEndpointId: process.env.ONDEMAND_ANALYSIS_ENDPOINT_ID || 'predefined-claude-sonnet-5',
-    agentIds: (process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean),
+    // v36: all model stages default to the endpoint proven live with the Zoho connector (predefined-gemini-3.6-flash); override via ONDEMAND_*_ENDPOINT_ID envs.
+    draftEndpointId: process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-gemini-3.6-flash',
+    sendEndpointId: process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash',
+    analysisEndpointId: process.env.ONDEMAND_ANALYSIS_ENDPOINT_ID || 'predefined-gemini-3.6-flash',
+    agentIds: (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean),
     // v31: the Zoho-Mail-capable OnDemand agent used for live inbox fetch + send.
     // Separated from the generic chat agentIds so the mail path can be pointed
     // at a mail-tool agent without disturbing the copilot drafting agent.
-    mailAgentIds: (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean),
+    mailAgentIds: (process.env.ONDEMAND_MAIL_AGENT_IDS || process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean),
     embeddingsUrl: process.env.ONDEMAND_EMBEDDINGS_URL || '', // optional remote embedding endpoint
   },
 
@@ -48,7 +48,12 @@ export const CONFIG = {
     maxResults: num(process.env.MAIL_MAX_RESULTS, 50),
     // v31: SHORT cache TTL for inbox fetches (was 7-day summary TTL) so the
     // dashboard reflects new mail within minutes, not days. Set 0 to bypass.
-    fetchTtlS: num(process.env.MAIL_FETCH_TTL_S, 180), // 3 minutes
+    // v38 (STALE-DECAY FIX, leg 3): 180s was SHORTER than the 10-minute
+    // inboxSync cron interval, so even with per-sync TTL renewal a single
+    // failed/slow sync let EMAIL_META entries lapse and the dashboard decay.
+    // 1800s (30 min) tolerates two missed cron ticks while still turning
+    // over stale mail within half an hour; env-overridable as before.
+    fetchTtlS: num(process.env.MAIL_FETCH_TTL_S, 1800), // 30 minutes
     mailbox: process.env.MAILBOX_ADDRESS || 'mk@airev.ae',
   },
 
@@ -118,7 +123,14 @@ export const CONFIG = {
     maxMs: num(process.env.RETRY_MAX_MS, 15000),
   },
   rateLimit: {
-    llmPerMin: num(process.env.LLM_RATE_PER_MIN, 30),
+    // v38 (audit d, finding 4): background analysis shares the SAME OnDemand
+    // endpoint as the live mail fetch. The old 30/min default let a post-sync
+    // burst of ~30 analysis queries starve the endpoint's TPM budget and
+    // 429 the NEXT inbox fetch (which then pushed the dashboard onto the
+    // lastGood fallback). 10/min keeps analysis flowing while leaving the
+    // mail fetch ample headroom; raise via LLM_RATE_PER_MIN when a dedicated
+    // analysis endpoint is configured (ONDEMAND_ANALYSIS_ENDPOINT_ID).
+    llmPerMin: num(process.env.LLM_RATE_PER_MIN, 10),
     zohoPerMin: num(process.env.ZOHO_RATE_PER_MIN, 60),
   },
 

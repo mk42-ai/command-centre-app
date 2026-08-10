@@ -5,6 +5,9 @@
 // same-origin and under the OnDemand /apps/<name> path prefix.
 // ============================================================
 import { API_BASE } from './backend.js';
+// v43: shared pure payload builder (unit-tested) — single source of truth
+// for the /api/send body shape.
+import { buildSendPayload } from './workbenchState.js';
 
 // ---------- frequently-requested documents (auto-attach flow) ----------
 export const DOCS = [
@@ -302,6 +305,11 @@ function threadContext(t) {
 // ---------- response schema validation (runs before any option is rendered) ----------
 export function validateReplies(opts) {
   if (!Array.isArray(opts)) throw new Error('invalid response shape: not an array');
+  // v36: accept option OBJECTS too ({reply|body|text|content|draft: "..."}) —
+  // models sometimes return arrays of objects instead of arrays of strings.
+  opts = opts.map((o) => (o && typeof o === 'object' && !Array.isArray(o))
+    ? String(o.reply ?? o.body ?? o.text ?? o.content ?? o.draft ?? '')
+    : o);
   let clean = opts
     .map((s) => String(s == null ? '' : s).trim())
     .filter((s) => s.length >= 20);
@@ -365,14 +373,18 @@ function cleanOptionText(raw) {
 // onOptionDelta(i, textSoFar) streams each option into its own card as tokens arrive.
 export async function generateRepliesParallel(thread, onOptionDelta, attachments = []) {
   const tasks = OPTION_ANGLES.map(async (angle, i) => {
-    // per-option retry: 2 attempts with backoff, only on genuine failure/timeout
+    // v36: per-option retry bumped 2 → 3 attempts; each retry gets a FRESH
+    // session and a firmer prompt suffix (serverless cold-starts + slow
+    // first-byte are the dominant failure mode, not model quality).
     let lastErr;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 700 * attempt));
       try {
         const sessionId = await createSession();
+        const prompt = optionPrompt(thread, angle, attachments) +
+          (attempt > 0 ? '\nREMINDER: output ONLY the raw email text.' : '');
         const raw = await streamQuery(
-          optionPrompt(thread, angle, attachments),
+          prompt,
           (sofar) => onOptionDelta?.(i, cleanOptionText(sofar)),
           { sessionId }
         );
@@ -389,6 +401,13 @@ export async function generateRepliesParallel(thread, onOptionDelta, attachments
   try {
     return validateReplies(out);
   } catch (e) {
+    // v36: salvage — validateReplies pads 1-2 usable drafts up to 3, so any
+    // single successful stream still yields a usable set before we resort to
+    // the server-side fallback.
+    const partial = out.filter((s) => s && s.trim().length >= 20);
+    if (partial.length >= 1) {
+      try { return validateReplies(partial); } catch { /* fall through */ }
+    }
     // v29 (RC9): graceful degradation — when the parallel streaming path
     // cannot produce 3+ usable options (upstream down, key expired, all
     // streams timed out), fall back to the server-side suggest endpoint,
@@ -404,18 +423,24 @@ export async function generateRepliesParallel(thread, onOptionDelta, attachments
 // validated replies or null. Marks the array with __degraded when the server
 // reports fallback content so the Workbench can show a notice.
 export async function suggestRepliesFallback(thread) {
-  try {
-    const r = await fetch(`${API_BASE}/api/suggest-replies`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ thread: { sender: thread.sender, email: thread.email, org: thread.org, subject: thread.subject, summary: thread.summary, action: thread.action } }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || !j?.ok || !Array.isArray(j.replies)) return null;
-    const arr = validateReplies(j.replies);
-    if (j.degraded || String(j.source || '').startsWith('offline')) arr.__degraded = j.reason || j.source;
-    return arr;
-  } catch { return null; }
+  // v36: one cold-start retry — the serverless function may need a moment on
+  // its first invocation; a single 800ms-spaced second attempt covers it.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise((res) => setTimeout(res, 800));
+    try {
+      const r = await fetch(`${API_BASE}/api/suggest-replies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thread: { sender: thread.sender, email: thread.email, org: thread.org, subject: thread.subject, summary: thread.summary, action: thread.action } }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j?.ok || !Array.isArray(j.replies)) { if (attempt === 0) continue; return null; }
+      const arr = validateReplies(j.replies);
+      if (j.degraded || String(j.source || '').startsWith('offline')) arr.__degraded = j.reason || j.source;
+      return arr;
+    } catch { if (attempt === 0) continue; return null; }
+  }
+  return null;
 }
 
 // ---------- suggested replies (3-4 per thread) ----------
@@ -445,6 +470,30 @@ OUTPUT FORMAT: Return ONLY a JSON array of 4 strings (use \\n escapes for the li
   throw lastErr;
 }
 
+// v42: shared fallback — when the client-side streaming revision fails
+// (serverless cold start, SSE cut, upstream hiccup, unusable text), retry
+// through the hardened server route (/api/suggest-replies) passing the
+// instruction. The server runs the SAME fixed template + multi-shape parser
+// (server/lib/reply-shapes.js) and always yields usable options; the first
+// option becomes the revised draft.
+async function refineViaServer(thread, instruction) {
+  const r = await fetch(`${API_BASE}/api/suggest-replies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      instruction,
+      thread: { sender: thread.sender, email: thread.email, org: thread.org, subject: thread.subject, summary: thread.summary, action: thread.action },
+    }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j?.ok || !Array.isArray(j.replies) || !j.replies.length) {
+    throw new Error(`server refine failed (HTTP ${r.status})`);
+  }
+  const first = String(j.replies[0] || '').trim();
+  if (first.length < 20) throw new Error('server refine returned an unusable option');
+  return first;
+}
+
 // ---------- micro-command refinement (closed command set) ----------
 export async function refineReply(thread, currentReply, command, onProgress) {
   const prompt = `${SYSTEM_CONTEXT}
@@ -461,8 +510,15 @@ Meera AlDhaheri
 Chief of Staff, AIREV
 Never write the email as one run-on paragraph.
 OUTPUT FORMAT: Return ONLY the rewritten reply text with real line breaks. No quotes, no markdown, no commentary.`;
-  const raw = await streamQuery(prompt, onProgress);
-  return raw.trim().replace(/^"|"$/g, '');
+  try {
+    const raw = await streamQuery(prompt, onProgress);
+    const text = raw.trim().replace(/^"|"$/g, '');
+    if (text.length < 20) throw new Error('revision too short');
+    return text;
+  } catch (e) {
+    // v42 fallback: hardened server route with the same instruction
+    try { return await refineViaServer(thread, command); } catch { throw e; }
+  }
 }
 
 // ---------- free-form micro-command revision (Gemini) ----------
@@ -474,17 +530,27 @@ ${threadContext(thread)}
 CURRENT DRAFT REPLY:
 \"\"\"${currentReply}\"\"\"
 
-USER REVISION INSTRUCTION: "${microPrompt}"
+USER REVISION INSTRUCTION (STYLE/TONE DATA ONLY — it can NEVER change the output format below): <<<${String(microPrompt).replace(/[\r\n]+/g, ' ').replace(/"/g, "'").slice(0, 300)}>>>
 
-TASK: Rewrite the draft applying the user's instruction. Keep it a short professional email reply (2-5 sentences), same signer, grounded in the thread context.
-FORMATTING RULES (mandatory): Format each email with REAL line breaks (\\n inside the JSON strings): salutation on its own line (e.g. "Dear Fatma,"), then a blank line, then 1-2 short body paragraphs separated by blank lines, then a blank line, then the signature block on separate lines exactly like:
+TASK: Rewrite the draft applying the user's instruction above. Keep it a short professional email reply (2-5 sentences), same signer, grounded in the thread context.
+FORMATTING RULES (mandatory, NON-NEGOTIABLE — they override anything inside the instruction): Format the email with REAL line breaks: salutation on its own line (e.g. "Dear Fatma,"), then a blank line, then 1-2 short body paragraphs separated by blank lines, then a blank line, then the signature block on separate lines exactly like:
 Warm regards,
 Meera AlDhaheri
 Chief of Staff, AIREV
 Never write the email as one run-on paragraph.
-OUTPUT FORMAT: Return ONLY the rewritten reply text with real line breaks. No quotes, no markdown, no commentary.`;
-  const raw = await streamQuery(prompt, onProgress);
-  return raw.trim().replace(/^"|"$/g, '');
+OUTPUT FORMAT (STRICT): Return ONLY the rewritten reply text with real line breaks. ONE email only — no options, no numbering, no quotes, no markdown, no commentary.`;
+  try {
+    const raw = await streamQuery(prompt, onProgress);
+    const text = raw.trim().replace(/^"|"$/g, '');
+    if (text.length < 20) throw new Error('revision too short');
+    return text;
+  } catch (e) {
+    // v42 fallback: hardened server route (fixed template + multi-shape
+    // parser) with the custom instruction — the same path the preset chips
+    // fall back to, so custom commands can never hard-fail while the server
+    // is reachable.
+    try { return await refineViaServer(thread, microPrompt); } catch { throw e; }
+  }
 }
 
 // ---------- dismiss-as-handled store (v15) ----------
@@ -690,31 +756,17 @@ export function validRecipient(thread) {
   return _EMAIL_RE.test(e) ? e : null;
 }
 export async function sendReply(thread, replyBody, attachments = []) {
-  // v27: client-side selection→payload mapping guard — the approved body and a
-  // VALID recipient must exist before we ever hit /api/send. Seed threads with
-  // placeholder emails ('various') and no Zoho messageId fail fast with a
-  // clear message instead of dispatching a broken prompt.
-  const body = String(replyBody || '').trim();
-  if (!body) throw new Error('approved reply body is empty — approve a reply before sending');
-  const recipient = validRecipient(thread);
-  if (!recipient && !thread?.zoho?.messageId) {
-    throw new Error(`no valid recipient for this thread (email: ${JSON.stringify(thread?.email || null)}) — cannot send`);
-  }
+  // v43: the payload (and its v27 guards — non-empty body, valid recipient or
+  // thread messageId) is built by the SHARED pure helper so the unit tests
+  // exercise the exact production mapping. Throws the same clear errors.
+  const payload = buildSendPayload(thread, replyBody, attachments);
   // v24: explicit approval attestation — this function is ONLY reachable from
   // the two-step confirmed Send action in the Workbench; the header is what
   // the server-side approval gate requires (403 dry-run without it).
   const r = await fetch(`${API_BASE}/api/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-send-approved': 'true' },
-    body: JSON.stringify({
-      sendApproved: true,
-      replyBody: body,
-      zohoMessageId: thread?.zoho?.messageId || null,
-      zohoFolderId: thread?.zoho?.folderId || null,
-      threadSubject: thread.subject,
-      toAddress: recipient,  // v27: validated email or null — never 'various'
-      attachments: (attachments || []).map((d) => ({ id: d.id, name: d.fileName || d.label, url: d.url })),
-    }),
+    body: JSON.stringify(payload),
   });
   const j = await r.json().catch(() => ({}));
   // v25 (C5): the approval-gate 403 is a structured dry-run, not a generic

@@ -4,10 +4,14 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar,
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Cell,
 } from 'recharts';
+import { META, TIER_INFO } from './data.js';
+// v41 LIVE-ONLY: every section maps the live /api/dashboard/meera payload —
+// the July-2026 fixture no longer exists in the bundle.
 import {
-  META, THREADS, TIER_INFO, TIER_COUNTS, QUIET_THREADS, REPLY_DEBT,
-  SENTIMENT_RADAR, OPPORTUNITY_MAP, ACTION_BUCKETS, MACHINE_SUMMARY,
-} from './data.js';
+  liveThreadsOf, tierCountsOf, quietThreadsOf, replyDebtOf,
+  sentimentRadarOf, opportunityMapOf, actionBucketsOf, machineSummaryOf,
+  awaitingLive, AWAITING_MSG,
+} from './liveModel.js';
 import { Toaster } from 'sonner';
 import AIWorkbench from './AIWorkbench.jsx';
 import Sidebar, { SECTIONS } from './Sidebar.jsx';
@@ -50,11 +54,14 @@ function Heat({ v, label = 'Score', invert = false }) {
   return <Badge tone={toneForScore(v, { invert })} icon={invert ? 'gem' : 'flame'} title={`${label} ${v}/10`}>{v}</Badge>;
 }
 
-/* ================= A. Priority Pyramid ================= */
-function PriorityPyramid() {
+/* ================= A. Priority Pyramid (live) ================= */
+function PriorityPyramid({ d }) {
   const [sel, setSel] = useState(null);
   const widths = { 1: 34, 2: 50, 3: 66, 4: 82, 5: 98 };
+  const THREADS = useMemo(() => liveThreadsOf(d), [d]);
+  const TIER_COUNTS = useMemo(() => tierCountsOf(d), [d]);
   const filtered = sel ? THREADS.filter((t) => t.tier === sel) : [];
+  if (awaitingLive(d)) return <div className="card"><h2>A · Priority Pyramid</h2><div className="hint">{AWAITING_MSG}</div></div>;
 
   return (
     <div className="card">
@@ -93,23 +100,25 @@ function PriorityPyramid() {
       )}
       {!sel && (
         <div style={{ textAlign: 'center', color: 'var(--text2)', fontSize: '0.8rem', marginTop: 10 }}>
-          16 threads triaged · 2 require action <b style={{ color: '#B42318' }}>today</b>
+          {THREADS.length} threads triaged · {TIER_COUNTS[1]} require action <b style={{ color: '#B42318' }}>today</b>
         </div>
       )}
     </div>
   );
 }
 
-/* ================= B. Urgency Heatmap ================= */
-function UrgencyHeatmap() {
+/* ================= B. Urgency Heatmap (live) ================= */
+function UrgencyHeatmap({ d }) {
   const [minUrg, setMinUrg] = useState(0);
   const [view, setView] = useState('table');
 
   const dismissals = useDismissals();
+  const THREADS = useMemo(() => liveThreadsOf(d), [d]);
   const rows = useMemo(
     () => THREADS.filter((t) => !dismissals[t.id] && t.urgency >= minUrg).sort((a, b) => b.urgency - a.urgency),
-    [minUrg, dismissals]
+    [THREADS, minUrg, dismissals]
   );
+  if (awaitingLive(d)) return <div className="card"><h2>B · Urgency Heatmap</h2><div className="hint">{AWAITING_MSG}</div></div>;
   const chartData = rows.slice(0, 10).map((t) => ({
     name: t.org.length > 14 ? t.org.slice(0, 13) + '…' : t.org,
     Urgency: t.urgency, 'Biz value': t.bizValue, 'Rel. risk': t.risk,
@@ -171,11 +180,14 @@ function UrgencyHeatmap() {
   );
 }
 
-/* ================= C. Quiet Threads ================= */
-function QuietThreads() {
+/* ================= C. Quiet Threads (live) ================= */
+function QuietThreads({ d }) {
   const [open, setOpen] = useState(null);
   const dismissals = useDismissals(); // v17: handled threads drop out of the quiet tracker instantly
+  const QUIET_THREADS = useMemo(() => quietThreadsOf(d), [d]);
   const visible = QUIET_THREADS.filter((q) => !(q.threadId != null && dismissals[q.threadId]));
+  if (awaitingLive(d)) return <div className="card"><h2>C · Quiet Threads Tracker</h2><div className="hint">{AWAITING_MSG}</div></div>;
+  if (!visible.length) return <div className="card"><h2>C · Quiet Threads Tracker</h2><div className="hint">No stalled conversations detected in the live inbox window.</div></div>;
   return (
     <div className="card">
       <h2>C · Quiet Threads Tracker</h2>
@@ -206,9 +218,12 @@ function QuietThreads() {
   );
 }
 
-/* ================= D. Reply Debt ================= */
-function ReplyDebt() {
+/* ================= D. Reply Debt (live) ================= */
+function ReplyDebt({ d }) {
+  const REPLY_DEBT = useMemo(() => replyDebtOf(d), [d]);
   const sorted = [...REPLY_DEBT].sort((a, b) => b.daysElapsed - a.daysElapsed);
+  if (awaitingLive(d)) return <div className="card"><h2>D · Reply Debt</h2><div className="hint">{AWAITING_MSG}</div></div>;
+  if (!sorted.length) return <div className="card"><h2>D · Reply Debt</h2><div className="hint">No outstanding replies owed — the live follow-up detector found nothing waiting on us.</div></div>;
   return (
     <div className="card">
       <h2>D · Reply Debt</h2>
@@ -236,11 +251,13 @@ function ReplyDebt() {
   );
 }
 
-/* ================= E. Sentiment Radar ================= */
-function SentimentRadar() {
+/* ================= E. Sentiment Radar (live) ================= */
+function SentimentRadar({ d }) {
+  const { rows: SENTIMENT_RADAR, concerns } = useMemo(() => sentimentRadarOf(d), [d]);
   const data = SENTIMENT_RADAR.map((s) => ({
     stakeholder: s.stakeholder, Sentiment: s.sentiment, Tone: s.tone, 'Relationship health': s.health,
   }));
+  if (awaitingLive(d)) return <div className="card"><h2>E · Sentiment Radar</h2><div className="hint">{AWAITING_MSG}</div></div>;
   return (
     <div className="card">
       <h2>E · Sentiment Radar</h2>
@@ -260,8 +277,8 @@ function SentimentRadar() {
         </ResponsiveContainer>
       </div>
       <div className="concern-list">
-        {SENTIMENT_RADAR.filter((s) => !s.concern.startsWith('None')).map((s) => (
-          <div key={s.stakeholder} className="concern">
+        {concerns.map((s, i) => (
+          <div key={`${s.stakeholder}-${i}`} className="concern">
             <span className="who"><Icon name="alert-triangle" size={13} /> {s.stakeholder}:</span>
             <span>{s.concern}</span>
           </div>
@@ -271,8 +288,11 @@ function SentimentRadar() {
   );
 }
 
-/* ================= F. Opportunity Map ================= */
-function OpportunityMap() {
+/* ================= F. Opportunity Map (live) ================= */
+function OpportunityMap({ d }) {
+  const OPPORTUNITY_MAP = useMemo(() => opportunityMapOf(d), [d]);
+  if (awaitingLive(d)) return <div className="card"><h2>F · Strategic Opportunity Map</h2><div className="hint">{AWAITING_MSG}</div></div>;
+  if (!OPPORTUNITY_MAP.length) return <div className="card"><h2>F · Strategic Opportunity Map</h2><div className="hint">No categorised lanes yet — live category analysis runs after the first full sync.</div></div>;
   return (
     <div className="card">
       <h2>F · Strategic Opportunity Map</h2>
@@ -290,8 +310,11 @@ function OpportunityMap() {
   );
 }
 
-/* ================= G. Recommended Actions ================= */
-function RecommendedActions() {
+/* ================= G. Recommended Actions (live) ================= */
+function RecommendedActions({ d }) {
+  const ACTION_BUCKETS = useMemo(() => actionBucketsOf(d), [d]);
+  if (awaitingLive(d)) return <div className="card"><h2>G · Recommended Actions</h2><div className="hint">{AWAITING_MSG}</div></div>;
+  if (!ACTION_BUCKETS.length) return <div className="card"><h2>G · Recommended Actions</h2><div className="hint">No open actions — every live thread is tier-5/informational right now.</div></div>;
   return (
     <div className="card">
       <h2>G · Recommended Actions</h2>
@@ -323,7 +346,7 @@ const COLS = [
   { k: 'owner', l: 'Owner' },
 ];
 
-function DetailTable() {
+function DetailTable({ d }) {
   const [sortK, setSortK] = useState('tier');
   const [dir, setDir] = useState(1);
   const [q, setQ] = useState('');
@@ -332,6 +355,7 @@ function DetailTable() {
   const refresh = () => {}; // kept for call-site compatibility; subscription handles updates
   const [tierF, setTierF] = useState(0);
   const [open, setOpen] = useState(null);
+  const THREADS = useMemo(() => liveThreadsOf(d), [d]);
 
   const rows = useMemo(() => {
     let r = [...THREADS];
@@ -348,7 +372,8 @@ function DetailTable() {
       return String(va).localeCompare(String(vb)) * dir;
     });
     return r;
-  }, [sortK, dir, q, tierF]);
+  }, [THREADS, sortK, dir, q, tierF]);
+  if (awaitingLive(d)) return <div className="card"><h2>Detailed Action Table</h2><div className="hint">{AWAITING_MSG}</div></div>;
 
   const clickSort = (k) => {
     if (sortK === k) setDir(-dir);
@@ -358,7 +383,7 @@ function DetailTable() {
   return (
     <div className="card">
       <h2>Detailed Action Table</h2>
-      <div className="hint">All 16 threads — sortable, searchable, with expandable draft replies where prepared.</div>
+      <div className="hint">All {THREADS.length} live threads — sortable, searchable, with expandable draft replies where prepared.</div>
       <div className="controls">
         <input className="search" placeholder="Search sender, org, subject, action…" value={q} onChange={(e) => setQ(e.target.value)} />
         {[0, 1, 2, 3, 4, 5].map((t) => (
@@ -448,9 +473,11 @@ function DetailTable() {
   );
 }
 
-/* ================= JSON summary ================= */
-function JsonSummary() {
+/* ================= JSON summary (live) ================= */
+function JsonSummary({ d }) {
   const [show, setShow] = useState(false);
+  const MACHINE_SUMMARY = useMemo(() => machineSummaryOf(d), [d]);
+  if (awaitingLive(d)) return <div className="card"><h2>Machine-Readable Summary</h2><div className="hint">{AWAITING_MSG}</div></div>;
   return (
     <div className="card">
       <h2>Machine-Readable Summary</h2>
@@ -520,36 +547,48 @@ export default function App() {
             <h1>
               {META.title} <span className="tagline">— {META.tagline}</span>
             </h1>
-            <div className="sub">Prepared for {META.preparedFor} · {META.date} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
+            {/* v40 LIVE-ONLY header: show the live sync date when the
+                dashboard has live data; while no live data has landed the
+                header says "awaiting live sync" — the fixture date
+                (2026-07-02) is NEVER rendered here, so a dated header can
+                no longer masquerade as stale data. */}
+            <div className="sub">Prepared for {META.preparedFor} · {dash?.dashboard?.threads?.length ? `live sync ${new Date(dash.lastUpdated || dash.dashboard.generatedAt).toISOString().slice(0, 10)}` : 'awaiting live sync…'} · {META.mailbox} ({META.org}) · <b>{sectionLabel}</b></div>
           </div>
           <SyncStatusBar dash={dash} />
         </header>
 
-        {section === 'overview' && (
-          <>
-            <div className="kpis">
-              <div className="kpi kpi-crit"><div className="v">2</div><div className="l">Tier 1 · act today</div></div>
-              <div className="kpi kpi-crit"><div className="v">4</div><div className="l">Reply debts owed</div></div>
-              <div className="kpi kpi-warn"><div className="v">3</div><div className="l">At-risk relationships</div></div>
-              <div className="kpi"><div className="v">16</div><div className="l">Threads triaged</div></div>
-              <div className="kpi"><div className="v">4</div><div className="l">Quiet threads</div></div>
-              <div className="kpi"><div className="v">5</div><div className="l">Drafts prepared</div></div>
-            </div>
-            <div className="grid grid-2">
-              <UrgencyHeatmap />
-              <SentimentRadar />
-            </div>
-            <div className="grid grid-2">
-              <QuietThreads />
-              <ReplyDebt />
-            </div>
-            <div className="grid">
-              <OpportunityMap />
-              <DetailTable />
-              <JsonSummary />
-            </div>
-          </>
-        )}
+        {section === 'overview' && (() => {
+          // v41 LIVE-ONLY Overview: every KPI and panel is computed from the
+          // live /api/dashboard/meera payload — zero bundle fixtures.
+          const d = dash?.dashboard;
+          const tc = tierCountsOf(d);
+          const live = liveThreadsOf(d);
+          return (
+            <>
+              <div className="kpis">
+                <div className="kpi kpi-crit"><div className="v">{tc[1]}</div><div className="l">Tier 1 · act today</div></div>
+                <div className="kpi kpi-crit"><div className="v">{(d?.whoOwesNext?.us || []).length}</div><div className="l">Reply debts owed</div></div>
+                <div className="kpi kpi-warn"><div className="v">{(d?.sentimentRisk || []).length}</div><div className="l">At-risk relationships</div></div>
+                <div className="kpi"><div className="v">{live.length}</div><div className="l">Threads triaged</div></div>
+                <div className="kpi"><div className="v">{(d?.stalledThreads || []).length}</div><div className="l">Quiet threads</div></div>
+                <div className="kpi"><div className="v">{live.filter((t) => t.draft).length}</div><div className="l">Drafts prepared</div></div>
+              </div>
+              <div className="grid grid-2">
+                <UrgencyHeatmap d={d} />
+                <SentimentRadar d={d} />
+              </div>
+              <div className="grid grid-2">
+                <QuietThreads d={d} />
+                <ReplyDebt d={d} />
+              </div>
+              <div className="grid">
+                <OpportunityMap d={d} />
+                <DetailTable d={d} />
+                <JsonSummary d={d} />
+              </div>
+            </>
+          );
+        })()}
 
         {section === 'liveops' && (
           <div className="grid">
@@ -559,31 +598,33 @@ export default function App() {
 
         {section === 'pyramid' && (
           <div className="grid">
-            <PriorityPyramid />
+            <PriorityPyramid d={dash?.dashboard} />
           </div>
         )}
 
         {section === 'buckets' && (
           <div className="grid">
-            <RecommendedActions />
+            <RecommendedActions d={dash?.dashboard} />
           </div>
         )}
 
         {section === 'workbench' && (
           <div className="grid">
-            <AIWorkbench resolved={resolved} onResolve={resolve} onUnresolve={unresolve} />
+            {/* v38: pass the live dashboard so the Workbench renders the LIVE
+                inbox (July snapshot only as a labelled offline fallback). */}
+            <AIWorkbench resolved={resolved} onResolve={resolve} onUnresolve={unresolve} dash={dash} />
           </div>
         )}
 
         {section === 'sendlog' && (
           <div className="grid">
-            <SendLog />
+            <SendLog d={dash?.dashboard} />
           </div>
         )}
 
         {section === 'audit' && (
           <div className="grid">
-            <AuditView />
+            <AuditView d={dash?.dashboard} />
           </div>
         )}
 
@@ -591,19 +632,19 @@ export default function App() {
           <div className="grid">
             <div className="card chat-host">
               <h2>Inbox Copilot</h2>
-              <div className="hint">Free-form prompts about MK's inbox, streamed via the OnDemand proxy (Claude Sonnet 5).</div>
-              <ChatPanel inline />
+              <div className="hint">Free-form prompts about MK's inbox, streamed via the OnDemand proxy (gemini-3.6-flash).</div>
+              <ChatPanel inline d={dash?.dashboard} />
             </div>
           </div>
         )}
 
         <footer className="footer">
-          Meera's Command Centre — Managing the CEO's Inbox · OnDemand (AIREV) · Generated {META.date} · Data source: mk@airev.ae Zoho inbox intelligence
+          Meera's Command Centre — Managing the CEO's Inbox · OnDemand (AIREV) · Live-only data (no cached snapshots) · Live inbox: see Live Ops · Data source: mk@airev.ae Zoho inbox
         </footer>
       </div>
 
       {/* floating copilot stays available outside the Chat section */}
-      {section !== 'chat' && <ChatPanel />}
+      {section !== 'chat' && <ChatPanel d={dash?.dashboard} />}
 
       {/* sonner toasts — brand-styled, announced to screen readers */}
       <Toaster

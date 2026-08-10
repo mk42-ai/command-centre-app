@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { streamQuery } from './ai.js';
-import { THREADS } from './data.js';
+import { liveThreadsOf } from './liveModel.js';
 import Icon from './Icon.jsx';
 
 /*
@@ -8,18 +8,24 @@ import Icon from './Icon.jsx';
  * slim edge tab when idle, slide-in panel; minimal chrome, rounded,
  * conversation scrolls above a single bottom-anchored input.
  * Free-form prompts run through the same OnDemand session via /api proxy.
+ *
+ * v41 LIVE-ONLY: the copilot preamble is built from the LIVE dashboard
+ * threads passed via the `d` prop — the July fixture brief is gone. When
+ * live data has not landed the preamble says so instead of inventing state.
  */
 
-const INBOX_BRIEF = THREADS.map(
-  (t) => `#${t.id} [T${t.tier}] ${t.org} — ${t.subject} · urgency ${t.urgency}/10 · risk ${t.risk}/10 · owner ${t.owner} · ${t.summary}`
-).join('\n');
-
-const CHAT_PREAMBLE = `You are the inbox copilot inside "Meera's Command Centre — Managing the CEO's Inbox" (AIREV/OnDemand). Meera AlDhaheri (Chief of Staff) and Sabiya use you to reason about MK's inbox. Be concise and actionable. Current triaged inbox state:
-${INBOX_BRIEF}
+const preambleFor = (d) => {
+  const threads = liveThreadsOf(d);
+  const brief = threads.length
+    ? threads.map((t) => `#${t.id} [T${t.tier}] ${t.org || t.sender} — ${t.subject} · urgency ${t.urgency}/10 · risk ${t.risk}/10 · owner ${t.owner} · ${t.summary}`).join('\n')
+    : '(live inbox not yet synced — no triaged state available; say so if asked about specific threads)';
+  return `You are the inbox copilot inside "Meera's Command Centre — Managing the CEO's Inbox" (AIREV/OnDemand). Meera AlDhaheri (Chief of Staff) and Sabiya use you to reason about MK's inbox. Be concise and actionable. Current LIVE triaged inbox state:
+${brief}
 
 USER QUESTION: `;
+};
 
-export default function ChatPanel({ inline = false }) {
+export default function ChatPanel({ inline = false, d = null }) {
   const [open, setOpen] = useState(inline);
   const [msgs, setMsgs] = useState([]); // {role:'user'|'ai', text}
   const [input, setInput] = useState('');
@@ -38,7 +44,7 @@ export default function ChatPanel({ inline = false }) {
     setMsgs((m) => [...m, { role: 'user', text: q }, { role: 'ai', text: '' }]);
     setBusy(true);
     try {
-      await streamQuery(CHAT_PREAMBLE + q, (sofar) => {
+      await streamQuery(preambleFor(d) + q, (sofar) => {
         setMsgs((m) => {
           const copy = m.slice();
           copy[copy.length - 1] = { role: 'ai', text: sofar };

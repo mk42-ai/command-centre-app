@@ -9,7 +9,9 @@ import '../server/lib/env.js'; // v25: .env loader (gitignored file, server-side
 import express from 'express';
 import { Readable } from 'node:stream';
 import { api as backendApi } from '../server/routes.js';
-import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs } from '../server/lib/ondemand.js';
+import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs, offlineSuggestions } from '../server/lib/ondemand.js';
+// v42: shared suggest-prompt template + hardened multi-shape parser.
+import { buildSuggestPrompt, parseReplyShapes, RETRY_PROMPT as SUGGEST_RETRY_PROMPT, sanitizeInstruction } from '../server/lib/reply-shapes.js';
 // v30: shared copilot session manager + env reconciliation report
 import { ensureCopilotSession, reinitCopilotSession, copilotSessionStatus } from '../server/lib/session.js';
 import { envReconciliation } from '../server/lib/env.js';
@@ -34,18 +36,19 @@ if (APP_TOKEN) {
 
 const BASE_URL = process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1';
 const API_KEY = process.env.ONDEMAND_API_KEY || '';
-const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean);
+// v36: default to the endpoint proven live with the Zoho connector
+// (predefined-gemini-3.6-flash); override via ONDEMAND_*_ENDPOINT_ID envs.
+const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
+const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
+const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 const MEDIA_BASE_URL = process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-demand.io/media/v1';
-// v25: media/v1 file ingest requires a FILE-capable plugin id in `agents` —
-// the chat agent (agent-1741770626) is NOT executable for ingest and returns
-// errors.no.executable.plugin.found (verified live). plugin-1713954536 is the
-// platform Chat-with-Files ingest plugin; override via env when needed.
-const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'plugin-1713954536').split(',').map((s) => s.trim()).filter(Boolean);
+// v35: media/v1 file ingest `agents` now carries the Zoho connector agent
+// (agent-1784351533). Override via ONDEMAND_FILE_AGENT_IDS if a dedicated
+// file-ingest plugin is ever required.
+const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 
 app.get('/api/health', (_req, res) => res.json({
-  ok: true, platform: 'vercel', version: 'v31', keyConfigured: odConfigured(),
+  ok: true, platform: 'vercel', version: 'v37', keyConfigured: odConfigured(),
   baseUrl: BASE_URL,                              // v30: /chat/v1-normalized base in effect
   draftEndpointId: DRAFT_ENDPOINT_ID, sendEndpointId: SEND_ENDPOINT_ID,
   mediaBaseUrl: MEDIA_BASE_URL, uploadRoute: true,
@@ -53,6 +56,18 @@ app.get('/api/health', (_req, res) => res.json({
   liveMailRoute: '/api/mail/fetch', docSelectRoute: '/api/documents/select', structuredSendRoute: '/api/send-structured',
   copilotSession: copilotSessionStatus(),        // v30: warm-session readiness
   envReconciliation,                              // v30: ON_DEMAND_*→ONDEMAND_* aliases fired
+  // v37: env-injection proof — which credentials/config are IN EFFECT
+  // (names and booleans only; never values).
+  agentIds: AGENT_IDS,
+  envSource: {
+    keyConfigured: odConfigured(),
+    keyFrom: process.env.ONDEMAND_API_KEY
+      ? (envReconciliation.aliased.some((a) => a.endsWith('→ONDEMAND_API_KEY')) ? 'alias:ON_DEMAND_API_KEY' : 'canonical:ONDEMAND_API_KEY')
+      : 'missing',
+    agentIdsFrom: process.env.ONDEMAND_AGENT_IDS ? 'env:ONDEMAND_AGENT_IDS' : 'default',
+    baseUrlNormalized: envReconciliation.baseUrlNormalized,
+    aliased: envReconciliation.aliased,
+  },
   ts: new Date().toISOString(),
 }));
 
@@ -130,7 +145,7 @@ app.post('/api/query', async (req, res) => {
 
 // ---- v23: /api/send — mirrors server.js exactly (was MISSING here, which
 // produced the 'Send failed: send 404' banner on Vercel). Executes the real
-// Zoho send via the agent tool on predefined-claude-sonnet-5, sync mode,
+// Zoho send via the agent tool on the reference-pattern endpoint, sync mode,
 // with heuristic outcome parsing; falls back to a fresh session on 404.
 
 // v27 (Empty-Recipients fix): authoritative delivery-details mapping layer.
@@ -359,6 +374,47 @@ app.post('/api/mail-dataset/poll', async (_req, res) => {
 });
 app.get('/api/mail-dataset/state', (_req, res) => {
   res.json({ ok: true, workflowId: WF_CONFIG.workflowId, pollMinutes: WF_CONFIG.pollMinutes, state: wfIngestState(), ts: new Date().toISOString() });
+});
+
+// ---------- v42: /api/suggest-replies — shared template + parser ----------
+// Prompt building and shape parsing live in server/lib/reply-shapes.js
+// (single source of truth with server.js). Accepts optional `instruction`
+// (preset chip OR free-form custom text) fenced inside the fixed template.
+app.post('/api/suggest-replies', async (req, res) => {
+  const t = req.body?.thread || {};
+  // v42: optional `instruction` — a preset chip ('warmer') OR free-form
+  // custom text, sanitized and fenced inside the SAME fixed template so the
+  // output contract (JSON array of 4 strings) never changes.
+  const instruction = sanitizeInstruction(req.body?.instruction || req.body?.command || '');
+  const started = Date.now();
+  const respond = (source, replies, extra = {}) =>
+    res.json({ ok: true, source, replies, count: replies.length, ms: Date.now() - started, ts: new Date().toISOString(), ...(instruction ? { instruction } : {}), ...extra });
+  if (!odConfigured()) {
+    console.log(JSON.stringify({ level: 'warn', msg: 'api.suggest.offline', reason: 'no-key' }));
+    return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: 'ONDEMAND_API_KEY not configured' });
+  }
+  try {
+    const sid = await odCreateSession({ externalUserId: `mcc-suggest-${Date.now()}` });
+    let r = await odQuerySync(sid, buildSuggestPrompt(t, instruction), { temperature: 0.7 });
+    let parsed = r.ok && r.answer ? parseReplyShapes(r.answer) : [];
+    console.log(JSON.stringify({ level: 'info', msg: 'api.suggest.attempt', attempt: 1, parsed: parsed.length, hasInstruction: Boolean(instruction) }));
+    if (parsed.length < 3) {
+      const r2 = await odQuerySync(sid, SUGGEST_RETRY_PROMPT, { temperature: 0.5 });
+      const parsed2 = r2.ok && r2.answer ? parseReplyShapes(r2.answer) : [];
+      console.log(JSON.stringify({ level: 'info', msg: 'api.suggest.attempt', attempt: 2, parsed: parsed2.length }));
+      if (parsed2.length > parsed.length) { parsed = parsed2; r = r2; }
+    }
+    if (parsed.length >= 3) return respond('ondemand-live', parsed.slice(0, 4), { sessionId: sid });
+    if (parsed.length >= 1) {
+      const combined = parsed.concat(offlineSuggestions(t)).slice(0, 4);
+      return respond('ondemand-live-padded', combined, { degraded: true, reason: 'padded-after-parse', sessionId: sid });
+    }
+    console.log(JSON.stringify({ level: 'warn', msg: 'api.suggest.fallback', upstreamStatus: r.status }));
+    return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: `upstream ${r.status}` });
+  } catch (e) {
+    console.log(JSON.stringify({ level: 'error', msg: 'api.suggest.error', error: String(e?.message || e) }));
+    return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: String(e?.message || e).slice(0, 200) });
+  }
 });
 
 app.use('/api', backendApi);

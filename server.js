@@ -18,6 +18,9 @@ import { syncInbox, refreshCache, generateDailyBriefing, rebuildDashboard, detec
 import { kv } from './server/lib/cache.js';
 // v25: single shared OnDemand client — the ONLY code path to api.on-demand.io
 import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs, offlineSuggestions } from './server/lib/ondemand.js';
+// v42: shared suggest-prompt template + hardened multi-shape parser (single
+// source of truth for BOTH entrypoints — fixes the custom micro-command bug).
+import { buildSuggestPrompt, parseReplyShapes, RETRY_PROMPT as SUGGEST_RETRY_PROMPT, sanitizeInstruction } from './server/lib/reply-shapes.js';
 // v30: copilot session lifecycle — boot warm-up + lazy re-init on drop
 import { warmupCopilotSession, ensureCopilotSession, reinitCopilotSession, copilotSessionStatus } from './server/lib/session.js';
 import { envReconciliation } from './server/lib/env.js';
@@ -83,23 +86,22 @@ if (BASE_PATH) {
 
 const BASE_URL = process.env.ONDEMAND_BASE_URL || 'https://api.on-demand.io/chat/v1';
 const API_KEY = process.env.ONDEMAND_API_KEY || '';
-// v21: all model stages default to Claude Sonnet 5 (draft, send, analysis)
-const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-claude-sonnet-5';
-const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1741770626').split(',').map((s) => s.trim()).filter(Boolean);
+// v36: all model stages default to the endpoint proven live with the Zoho connector (predefined-gemini-3.6-flash); override via ONDEMAND_*_ENDPOINT_ID envs.
+const DRAFT_ENDPOINT_ID = process.env.ONDEMAND_DRAFT_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
+const SEND_ENDPOINT_ID = process.env.ONDEMAND_SEND_ENDPOINT_ID || 'predefined-gemini-3.6-flash';
+const AGENT_IDS = (process.env.ONDEMAND_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 const MEDIA_BASE_URL = process.env.ONDEMAND_MEDIA_BASE_URL || 'https://api.on-demand.io/media/v1';
-// v25: media/v1 file ingest requires a FILE-capable plugin id in `agents` —
-// the chat agent (agent-1741770626) is NOT executable for ingest and returns
-// errors.no.executable.plugin.found (verified live). plugin-1713954536 is the
-// platform Chat-with-Files ingest plugin; override via env when needed.
-const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'plugin-1713954536').split(',').map((s) => s.trim()).filter(Boolean);
+// v35: media/v1 file ingest `agents` now carries the Zoho connector agent
+// (agent-1784351533). Override via ONDEMAND_FILE_AGENT_IDS if a dedicated
+// file-ingest plugin is ever required.
+const FILE_AGENT_IDS = (process.env.ONDEMAND_FILE_AGENT_IDS || 'agent-1784351533').split(',').map((s) => s.trim()).filter(Boolean);
 const PORT = Number(process.env.PORT || 5173);
 
 // ---------- health ----------
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'v31',
+    version: 'v37',
     keyConfigured: odConfigured(),               // v30: derive from live client (post env-reconciliation)
     baseUrl: BASE_URL,                           // v30: proves the /chat/v1-normalized base is in effect
     suggestRoute: true,
@@ -117,6 +119,18 @@ app.get('/api/health', (_req, res) => {
     structuredSendRoute: '/api/send-structured',
     copilotSession: copilotSessionStatus(),      // v30: warm-session readiness + reinit count
     envReconciliation,                            // v30: which ON_DEMAND_*→ONDEMAND_* aliases fired
+    // v37: env-injection proof — which credentials/config are IN EFFECT
+    // (names and booleans only; never values).
+    agentIds: AGENT_IDS,
+    envSource: {
+      keyConfigured: odConfigured(),
+      keyFrom: process.env.ONDEMAND_API_KEY
+        ? (envReconciliation.aliased.some((a) => a.endsWith('→ONDEMAND_API_KEY')) ? 'alias:ON_DEMAND_API_KEY' : 'canonical:ONDEMAND_API_KEY')
+        : 'missing',
+      agentIdsFrom: process.env.ONDEMAND_AGENT_IDS ? 'env:ONDEMAND_AGENT_IDS' : 'default',
+      baseUrlNormalized: envReconciliation.baseUrlNormalized,
+      aliased: envReconciliation.aliased,
+    },
     ts: new Date().toISOString(),
   });
 });
@@ -146,7 +160,7 @@ app.post('/api/session', async (req, res) => {
 
 // ---------- streaming query proxy (pipes SSE through untouched) ----------
 // v24 DRAFT-GUARD: /api/query is the DRAFT/CHAT path. The connected agent
-// (agent-1741770626) carries live Zoho Mail send tools, and in the 2026-07-04
+// (agent-1784351533) carries live Zoho Mail send tools, and in the 2026-07-04
 // incident a drafting prompt containing "Required next action: SEND NOW …"
 // caused the agent to EXECUTE a real send to Fatma during generation. Every
 // query through this proxy is therefore hard-prefixed with a tool-use ban —
@@ -412,44 +426,49 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
-// ---------- v29 (RC9): server-side auto-suggest with graceful fallback ----------
+// v42: parseReplyShapes moved to server/lib/reply-shapes.js (shared).
+
+// ---------- v29 (RC9) / v36 (hardened): server-side auto-suggest with
+// graceful fallback ----------
 // POST /api/suggest-replies { thread:{sender,email,org,subject,summary,...}, count? }
-// Live path: one sync OnDemand call (timeout+retry in the shared client) that
-// returns 4 short reply drafts. Degraded path (no key / upstream down after
-// retries): deterministic offlineSuggestions so the UI ALWAYS has content —
+// Live path: one sync OnDemand call (timeout+retry in the shared client),
+// normalized via parseReplyShapes; if that yields <3 options, ONE retry is
+// made on the SAME session with a stricter prompt. If still <3 but >=1
+// usable option survives, the set is padded deterministically with
+// offlineSuggestions() so the UI always renders >=3 replies. Only when ZERO
+// options survive both attempts do we fall back fully to offlineSuggestions,
 // flagged with source:'offline-fallback' so the client can badge it.
 app.post('/api/suggest-replies', async (req, res) => {
   const t = req.body?.thread || {};
+  // v42: optional `instruction` — a preset chip ('warmer') OR free-form
+  // custom text. Sanitized and embedded in the SAME fixed template as
+  // instruction-less generation, so the output contract never changes.
+  const instruction = sanitizeInstruction(req.body?.instruction || req.body?.command || '');
   const started = Date.now();
   const respond = (source, replies, extra = {}) =>
-    res.json({ ok: true, source, replies, count: replies.length, ms: Date.now() - started, ts: new Date().toISOString(), ...extra });
+    res.json({ ok: true, source, replies, count: replies.length, ms: Date.now() - started, ts: new Date().toISOString(), ...(instruction ? { instruction } : {}), ...extra });
   if (!odConfigured()) {
     logger.warn('api.suggest.offline', { reason: 'no-key' });
     return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: 'ONDEMAND_API_KEY not configured' });
   }
   try {
     const sid = await odCreateSession({ externalUserId: `mcc-suggest-${Date.now()}` });
-    const prompt =
-      `You draft short professional email replies for MK (CEO) / Meera AlDhaheri (Chief of Staff) at AIREV.\n` +
-      `THREAD: from ${t.sender || 'the counterparty'} <${t.email || 'unknown'}> (${t.org || 'their organisation'}) — subject "${t.subject || '(no subject)'}".\n` +
-      `SITUATION: ${t.summary || t.action || 'They await a reply.'}\n` +
-      `TASK: Write exactly 4 alternative SHORT reply emails (2-4 sentences each, max ~70 words), angles: confirm-and-commit, warm relationship repair, crisp status update, firm-but-polite with a date. ` +
-      `Salutation on its own line, blank line, 1-2 short paragraphs, blank line, then sign off exactly: Warm regards,\nMeera AlDhaheri\nChief of Staff, AIREV\n` +
-      `OUTPUT (STRICT): ONLY a JSON array of 4 strings with \\n escapes. No markdown, no commentary.`;
-    const r = await odQuerySync(sid, prompt, { temperature: 0.7 });
-    if (r.ok && r.answer) {
-      try {
-        const m = String(r.answer).match(/\[[\s\S]*\]/);
-        const arr = JSON.parse(m ? m[0] : r.answer);
-        const clean = (Array.isArray(arr) ? arr : []).map((x) => String(x).trim()).filter((x) => x.length >= 20);
-        if (clean.length >= 3) return respond('ondemand-live', clean.slice(0, 4), { sessionId: sid });
-      } catch { /* fall through to fallback below */ }
-      // model answered but not parseable as >=3 options — salvage as one option + fallback pads
-      const one = String(r.answer).trim();
-      if (one.length >= 40) {
-        const pads = offlineSuggestions(t);
-        return respond('ondemand-live-salvaged', [one, ...pads].slice(0, 4), { degraded: true, reason: 'unparseable-array' });
-      }
+    let r = await odQuerySync(sid, buildSuggestPrompt(t, instruction), { temperature: 0.7 });
+    let parsed = r.ok && r.answer ? parseReplyShapes(r.answer) : [];
+    logger.info('api.suggest.attempt', { attempt: 1, parsed: parsed.length, hasInstruction: Boolean(instruction) });
+    if (parsed.length < 3) {
+      // attempt 2: retry ONCE on the SAME session with the strict-format prompt
+      const r2 = await odQuerySync(sid, SUGGEST_RETRY_PROMPT, { temperature: 0.5 });
+      const parsed2 = r2.ok && r2.answer ? parseReplyShapes(r2.answer) : [];
+      logger.info('api.suggest.attempt', { attempt: 2, parsed: parsed2.length });
+      if (parsed2.length > parsed.length) { parsed = parsed2; r = r2; }
+    }
+    if (parsed.length >= 3) return respond('ondemand-live', parsed.slice(0, 4), { sessionId: sid });
+    if (parsed.length >= 1) {
+      // both attempts landed <3 but >=1 usable option — pad deterministically
+      // rather than discard the live content entirely.
+      const combined = parsed.concat(offlineSuggestions(t)).slice(0, 4);
+      return respond('ondemand-live-padded', combined, { degraded: true, reason: 'padded-after-parse', sessionId: sid });
     }
     logger.warn('api.suggest.fallback', { upstreamStatus: r.status });
     return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: `upstream ${r.status}` });
@@ -554,11 +573,13 @@ app.listen(PORT, '0.0.0.0', () => {
   warmupCopilotSession().then((sid) => {
     console.log(`[v30] copilot session warm-up: ${sid ? `ready (${sid})` : 'deferred (will lazy-init on first request)'}`);
   }).catch(() => {});
-  // boot warm-up: one incremental sync primes the cache so the very first
-  // dashboard request is served hot; failures fall back to lastGood state.
+  // boot warm-up: one incremental sync primes the live model so the very
+  // first dashboard request is served hot. v40 LIVE-ONLY: on failure the
+  // dashboard answers with an explicit degraded-empty shape (never any
+  // cached/snapshot state) and the next poll retries the live sync.
   syncInbox({}).then((r) => {
     console.log(`[v19] boot sync: provider=${r.provider} seen=${r.seen} newOrChanged=${r.newOrChanged}`);
-  }).catch((e) => console.error(`[v19] boot sync failed (dashboard serves lastGood fallback): ${e?.message || e}`));
+  }).catch((e) => console.error(`[v40] boot sync failed (dashboard stays live-only degraded-empty until a sync lands): ${e?.message || e}`));
   process.on('SIGTERM', () => { kv.flush(); process.exit(0); });
   process.on('SIGINT', () => { kv.flush(); process.exit(0); });
 });

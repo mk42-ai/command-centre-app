@@ -1,0 +1,154 @@
+{
+  "ranAt": "2026-08-09T18:01:13.035Z",
+  "base": "https://api.on-demand.io/chat/v1",
+  "endpointId": "predefined-gemini-3.6-flash",
+  "agentId": "agent-1784351533",
+  "previewUrl": "https://sb-4elbikli91sd.vercel.run",
+  "baseline": [
+    "1786287423191141900",
+    "1786286464610141300",
+    "1786286454401141900",
+    "1786281870421141900",
+    "1786277848903141900",
+    "1786274767668141900",
+    "1786274208925141800",
+    "1786263130726141900",
+    "1786255553483141900",
+    "1786255198411141900"
+  ],
+  "results": [
+    {
+      "name": "T1 session.create agentIds=[agent-1784351533]",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T17:54:38.480Z",
+      "endedAt": "2026-08-09T17:54:38.817Z",
+      "ms": 338,
+      "detail": {
+        "status": 201,
+        "sessionId": "6a78bede9a7cc5635a619385"
+      }
+    },
+    {
+      "name": "T2 query.sync recent emails via connector",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T17:54:38.818Z",
+      "endedAt": "2026-08-09T17:55:15.118Z",
+      "ms": 36300,
+      "detail": {
+        "status": 200,
+        "count": 20,
+        "bareNumberIds": 0,
+        "first3Ids": [
+          "1786297639485141900",
+          "1786297374746141900",
+          "1786295543870141901"
+        ]
+      }
+    },
+    {
+      "name": "T3 baseline containment + newest-first ordering",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T17:55:15.118Z",
+      "endedAt": "2026-08-09T17:55:15.118Z",
+      "ms": 0,
+      "detail": {
+        "matched": 9,
+        "newerPrefix": 11,
+        "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T4 app fetchRecentMail() returns baseline newest-first",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T17:55:15.118Z",
+      "endedAt": "2026-08-09T17:57:41.314Z",
+      "ms": 146196,
+      "detail": {
+        "count": 20,
+        "firstId": "1786297639485141900",
+        "agentId": "agent-1784351533",
+        "matchedBaseline": 9,
+        "newerPrefix": 11,
+        "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T5 media upload with agents=[connector] (optional)",
+      "required": false,
+      "status": "FAIL",
+      "startedAt": "2026-08-09T17:57:41.314Z",
+      "endedAt": "2026-08-09T17:57:42.005Z",
+      "ms": 691,
+      "error": "media upload HTTP 500: {\"message\":\"errors.no.executable.plugin.found\",\"errorCode\":\"server_error\"}"
+    },
+    {
+      "name": "T6 no legacy IDs remain in codebase",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T17:57:42.005Z",
+      "endedAt": "2026-08-09T17:57:42.010Z",
+      "ms": 5,
+      "detail": {
+        "filesScanned": 41
+      }
+    },
+    {
+      "name": "T7 dashboard.recentEmails newest-first + baseline containment",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T17:57:42.010Z",
+      "endedAt": "2026-08-09T18:00:53.124Z",
+      "ms": 191114,
+      "detail": {
+        "count": 20,
+        "firstId": "1786297639485141900",
+        "matchedBaseline": 9,
+        "newerPrefix": 11,
+        "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T8 deployed preview /api/dashboard/meera returns 200 with LIVE data",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T18:00:53.124Z",
+      "endedAt": "2026-08-09T18:00:53.387Z",
+      "ms": 263,
+      "detail": {
+        "status": 200,
+        "source": "rebuilt",
+        "degraded": false,
+        "dataAgeMs": 0,
+        "count": 20,
+        "firstId": "1786297639485141900",
+        "matchedBaseline": 9,
+        "newerPrefix": 11,
+        "ordering": "newest-first"
+      }
+    },
+    {
+      "name": "T9 deployed preview /api/suggest-replies returns >=3 usable options",
+      "required": true,
+      "status": "PASS",
+      "startedAt": "2026-08-09T18:00:53.387Z",
+      "endedAt": "2026-08-09T18:01:13.035Z",
+      "ms": 19648,
+      "detail": {
+        "status": 200,
+        "source": "ondemand-live",
+        "count": 4,
+        "degraded": false
+      }
+    }
+  ],
+  "summary": {
+    "total": 9,
+    "passed": 8,
+    "failed": 1,
+    "requiredFailed": 0
+  }
+}

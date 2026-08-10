@@ -97,6 +97,14 @@ for (const [canonical, alts] of Object.entries(ALIASES)) {
 export function normalizeChatBase(u) {
   if (!u) return u;
   let s = String(u).trim().replace(/\/+$/, '');
+  // v36 (ROOT-CAUSE FIX for intermittent dashboard 500s): per the live OnDemand
+  // docs host table, Chat & Agent Tools are served from api.on-demand.io;
+  // gateway.on-demand.io is the config/docs host. The platform injects
+  // ON_DEMAND_BASE_URL as the gateway host, where session-create happens to
+  // proxy but /query calls hang or drop intermittently (verified live:
+  // 'od.query.sync network error: fetch failed' after ~37-59s). Rewrite the
+  // host so every chat call lands on the documented chat host.
+  s = s.replace(/^https?:\/\/gateway\.on-demand\.io/i, 'https://api.on-demand.io');
   if (/\/chat\/v\d+$/i.test(s)) return s;      // already a chat/vN root
   s = s.replace(/\/chat$/i, '');                // '<host>/chat' → '<host>'
   return `${s}/chat/v1`;

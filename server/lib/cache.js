@@ -34,11 +34,19 @@ export class KVCache {
 
   static key(ns, id) { return `${ns}:${id}`; }
 
+  // v40 (LIVE-ONLY): the assembled dashboard must NEVER exist as a disk
+  // artifact — a persisted dashboard blob is exactly the "cached snapshot"
+  // that can be transported between deploys/restarts and rendered stale.
+  // Dashboard entries are memory-only: excluded from every flush AND
+  // discarded on load if an older build's file still contains them.
+  static _isSnapshotKey(k) { return String(k).startsWith('dashboard:'); }
+
   _load() {
     try {
       if (fs.existsSync(this.file)) {
         const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'));
         for (const [k, e] of Object.entries(raw)) {
+          if (KVCache._isSnapshotKey(k)) continue; // stale-snapshot guard
           if (!e.exp || e.exp > now()) this.map.set(k, e);
         }
       }
@@ -50,7 +58,10 @@ export class KVCache {
     try {
       fs.mkdirSync(this.dir, { recursive: true });
       const tmp = `${this.file}.tmp-${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.map)), 'utf8');
+      const persistable = Object.fromEntries(
+        [...this.map].filter(([k]) => !KVCache._isSnapshotKey(k)),
+      );
+      fs.writeFileSync(tmp, JSON.stringify(persistable), 'utf8');
       fs.renameSync(tmp, this.file); // atomic on POSIX
       this.dirty = false;
     } catch { /* disk issues degrade to memory-only */ }

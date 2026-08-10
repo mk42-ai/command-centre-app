@@ -1,8 +1,10 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { THREADS, TIER_INFO } from './data.js';
+import { TIER_INFO } from './data.js';
 import { toast } from 'sonner';
 import { motion, useReducedMotion } from 'framer-motion';
 import { generateRepliesParallel, refineReply, reviseReplyFreeform, matchDoc, DOCS, MICRO_COMMANDS, sendReply, uploadAttachment, loadSendLog, appendSendLog, DISMISS_OPTIONS, CURRENT_USER, recordDismissal, undoDismissal, loadDismissals } from './ai.js';
+// v43: pure, unit-tested state helpers — the selectability fix lives here.
+import { commitRevision, revisionCommittedState } from './workbenchState.js';
 import Badge, { toneForScore } from './Badge.jsx';
 import Icon from './Icon.jsx';
 
@@ -159,11 +161,17 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
         ? await reviseReplyFreeform(thread, replies[selIdx], c)
         : await refineReply(thread, replies[selIdx], c.toLowerCase());
       setCmd('');
-      runWordStream(revised, (finalText) => {
-        setReplies((rs) => rs.map((r, i) => (i === selIdx ? finalText : r)));
-        setPhase('ready');
-        busyRef.current = false;
-      });
+      // v43 (SELECTABILITY FIX): commit the revised option + ready state
+      // SYNCHRONOUSLY the moment the revision arrives. Previously this
+      // happened only inside the word-reveal interval's completion callback;
+      // if that timer died (background-tab throttling, re-render), a
+      // CUSTOM-refined card stayed 'refining' forever — displayed but not
+      // selectable/approvable/sendable. The reveal below is cosmetic only.
+      setReplies((rs) => commitRevision(rs, selIdx, revised));
+      const committed = revisionCommittedState();
+      setPhase(committed.phase);
+      busyRef.current = committed.busy;
+      runWordStream(revised, () => { /* cosmetic reveal only — state already committed */ });
     } catch (e) {
       toast.error('Revision failed', { description: String(e.message || e).slice(0, 120) });
       setErr(`Revision failed (${String(e.message || e)}).`);
@@ -502,21 +510,65 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
   );
 }
 
-export default function AIWorkbench({ resolved, onResolve, onUnresolve }) {
+export default function AIWorkbench({ resolved, onResolve, onUnresolve, dash }) {
   const [tierF, setTierF] = useState(0);
   const [showResolved, setShowResolved] = useState(false);
 
+  // v38 (LIVE-FIRST FIX — the "stale July 8th emails" root cause): this view
+  // previously rendered ONLY the static July-2026 snapshot compiled into
+  // src/data.js, regardless of what /api/dashboard/meera returned. It now
+  // consumes the LIVE dashboard threads whenever they are available (mapped
+  // to the workbench thread shape); the July snapshot remains ONLY as a
+  // clearly-labelled offline fallback when the backend has no live data yet.
+  const liveThreads = useMemo(() => {
+    const list = dash?.dashboard?.threads || [];
+    return list.map((t) => ({
+      id: t.threadId,
+      zoho: t.zoho || { messageId: String(t.threadId) },
+      sender: t.sender || t.email || 'unknown',
+      email: t.email || '',
+      org: t.org || '',
+      role: '',
+      subject: t.subject || '(no subject)',
+      lastActivity: t.lastActivity || null,
+      summary: t.summary || '',
+      tier: t.tier ?? 3,
+      tierReason: t.tierReason || '',
+      sentiment: t.sentiment || 'Neutral',
+      urgency: t.urgency ?? 5,
+      risk: t.risk ?? 4,
+      bizValue: t.bizValue ?? 5,
+      relationship: t.relationship || 'Unknown',
+      owner: t.owner || null,
+      action: t.action || null,
+      deadline: t.deadline || null,
+      bucket: t.bucket || null,
+      category: t.category || null,
+    }));
+  }, [dash?.dashboard?.threads]);
+  const usingLive = liveThreads.length > 0;
+  // v40 LIVE-ONLY: the July-2026 fixture fallback is REMOVED — when no live
+  // data has landed the workbench renders an explicit empty "awaiting live
+  // sync" state instead of the dated snapshot. The 2026-07-02 content can
+  // no longer appear in this view under any condition.
+  const SOURCE_THREADS = liveThreads;
+
   const active = useMemo(
-    () => THREADS.filter((t) => !resolved[t.id] && (tierF === 0 || t.tier === tierF)).sort((a, b) => a.tier - b.tier || b.urgency - a.urgency),
-    [resolved, tierF]
+    () => SOURCE_THREADS.filter((t) => !resolved[t.id] && (tierF === 0 || t.tier === tierF)).sort((a, b) => a.tier - b.tier || b.urgency - a.urgency),
+    [SOURCE_THREADS, resolved, tierF]
   );
-  const done = useMemo(() => THREADS.filter((t) => resolved[t.id]), [resolved]);
+  const done = useMemo(() => SOURCE_THREADS.filter((t) => resolved[t.id]), [SOURCE_THREADS, resolved]);
 
   return (
     <div className="card">
       <h2>AI Reply Workbench <span className="wb-live-dot" title="Live inference via OnDemand" /></h2>
       <div className="hint">
-        Live suggested replies per thread (OnDemand · claude-sonnet-5 via server-side proxy) · micro-commands: warmer / firmer / shorter / formal / add deadline / soften · approve triggers document auto-attach · dismiss stamps MK / SK / MA ownership.
+        Live suggested replies per thread (OnDemand · gemini-3.6-flash via server-side proxy) · micro-commands: warmer / firmer / shorter / formal / add deadline / soften · approve triggers document auto-attach · dismiss stamps MK / SK / MA ownership.
+      </div>
+      <div className="hint" data-thread-source={usingLive ? 'live' : 'awaiting-live-sync'}>
+        {usingLive
+          ? <>Threads: <b>LIVE inbox</b> — synced {dash?.lastUpdated ? new Date(dash.lastUpdated).toLocaleString() : 'just now'} via the Zoho connector (newest first by tier).</>
+          : <>Threads: <b style={{ color: '#B54708' }}>awaiting live sync…</b> — no data is shown until the live inbox loads (live-only, no cached snapshots); press Sync or wait for the next poll.</>}
       </div>
       <div className="controls">
         {[0, 1, 2, 3, 4, 5].map((t) => (

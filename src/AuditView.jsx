@@ -1,6 +1,9 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import { toast } from 'sonner';
-import { THREADS, TIER_INFO } from './data.js';
+import { TIER_INFO } from './data.js';
+// v41 LIVE-ONLY: ranked/handled tables use the LIVE dashboard threads (prop
+// `d`) — the July fixture import is gone.
+import { liveThreadsOf, awaitingLive, AWAITING_MSG } from './liveModel.js';
 import {
   loadHandledLog, loadResolved, TIER_FACTORS,
   loadDismissals, loadDismissLog, undoDismissal, subscribeDismissals,
@@ -35,11 +38,13 @@ function factorsFor(t) {
   return { deadline, tierScore, risk, sentiment, composite: Math.round(composite * 10) / 10 };
 }
 
-export default function AuditView() {
+export default function AuditView({ d = null }) {
   // reactive dismissal state: any dismiss/undo anywhere in the app triggers
   // an immediate recompute here (scores, ranks, badges) without a reload.
   const [dismissals, setDismissals] = useState(() => loadDismissals());
   useEffect(() => subscribeDismissals(() => setDismissals({ ...loadDismissals() })), []);
+
+  const THREADS = useMemo(() => liveThreadsOf(d), [d]);
 
   // (a) PENDING ranking — dismissed threads excluded, remainder re-ranked
   const ranked = useMemo(
@@ -47,7 +52,7 @@ export default function AuditView() {
       THREADS.filter((t) => !dismissals[t.id])
         .map((t) => ({ t, f: factorsFor(t) }))
         .sort((a, b) => b.t.urgency - a.t.urgency || b.f.composite - a.f.composite),
-    [dismissals]
+    [THREADS, dismissals]
   );
 
   // (b) HANDLED — one row per currently-dismissed thread
@@ -88,7 +93,7 @@ export default function AuditView() {
     }
     rows.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
     return rows;
-  }, [dismissals]);
+  }, [THREADS, dismissals]);
 
   const restore = (row) => {
     const t = THREADS.find((x) => String(x.id) === String(row.threadId));
@@ -96,6 +101,10 @@ export default function AuditView() {
     const ev = undoDismissal(t);
     toast.success(`Restored "${t.subject.slice(0, 36)}"`, { description: ev ? `undo logged ${ev.ts}` : '' });
   };
+
+  if (awaitingLive(d)) {
+    return <div className="card"><h2><Icon name="layers" size={16} /> Algorithm &amp; Audit</h2><div className="hint">{AWAITING_MSG}</div></div>;
+  }
 
   return (
     <>
