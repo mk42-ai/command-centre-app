@@ -10,6 +10,8 @@ import express from 'express';
 import { Readable } from 'node:stream';
 import { api as backendApi } from '../server/routes.js';
 import { createSession as odCreateSession, queryStream as odQueryStream, querySync as odQuerySync, uploadMedia as odUploadMedia, odConfigured, fullModelConfigs, offlineSuggestions } from '../server/lib/ondemand.js';
+// v42: shared suggest-prompt template + hardened multi-shape parser.
+import { buildSuggestPrompt, parseReplyShapes, RETRY_PROMPT as SUGGEST_RETRY_PROMPT, sanitizeInstruction } from '../server/lib/reply-shapes.js';
 // v30: shared copilot session manager + env reconciliation report
 import { ensureCopilotSession, reinitCopilotSession, copilotSessionStatus } from '../server/lib/session.js';
 import { envReconciliation } from '../server/lib/env.js';
@@ -374,103 +376,30 @@ app.get('/api/mail-dataset/state', (_req, res) => {
   res.json({ ok: true, workflowId: WF_CONFIG.workflowId, pollMinutes: WF_CONFIG.pollMinutes, state: wfIngestState(), ts: new Date().toISOString() });
 });
 
-// ---------- v36: /api/suggest-replies — EXACT parity with server.js ----------
-// This route existed ONLY in server.js; on Vercel the client fallback hit the
-// JSON-404 catch-all below, so when the 4 parallel streams under-delivered the
-// Workbench showed "Generation failed (invalid response shape: fewer than 3
-// usable options)". Same hardened pipeline as server.js: multi-shape parse →
-// one strict-prompt retry on the SAME session → deterministic padding → >=3
-// options ALWAYS returned with ok:true.
-function parseReplyShapes(rawAnswer) {
-  const asStr = (v) => (v == null ? '' : String(v));
-  let text = asStr(rawAnswer).trim();
-  if (!text) return [];
-  text = text.replace(/```[a-zA-Z]*\s*([\s\S]*?)```/g, '$1').trim();
-  const pickStringFromObject = (o) => {
-    if (typeof o === 'string') return o;
-    if (!o || typeof o !== 'object') return '';
-    for (const k of ['reply', 'body', 'text', 'content', 'draft', 'message']) {
-      if (typeof o[k] === 'string' && o[k].trim()) return o[k];
-    }
-    for (const k of Object.keys(o)) {
-      if (typeof o[k] === 'string' && o[k].trim()) return o[k];
-    }
-    return '';
-  };
-  const fromArrayLike = (v) => {
-    if (!Array.isArray(v)) return null;
-    const out = v.map((x) => asStr(pickStringFromObject(x)).trim()).filter((s) => s.length >= 20);
-    return out.length ? out : null;
-  };
-  const tryJson = (str) => { try { return JSON.parse(str); } catch { return null; } };
-  let parsed = tryJson(text);
-  if (parsed == null) {
-    const start = text.indexOf('[');
-    const end = text.lastIndexOf(']');
-    if (start >= 0 && end > start) parsed = tryJson(text.slice(start, end + 1));
-  }
-  if (parsed == null) {
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start >= 0 && end > start) parsed = tryJson(text.slice(start, end + 1));
-  }
-  if (parsed != null) {
-    if (Array.isArray(parsed)) {
-      const arr = fromArrayLike(parsed);
-      if (arr) return arr;
-    } else if (typeof parsed === 'object') {
-      for (const k of ['replies', 'options', 'drafts', 'suggestions', 'answers']) {
-        if (Array.isArray(parsed[k])) {
-          const arr = fromArrayLike(parsed[k]);
-          if (arr) return arr;
-        }
-      }
-    }
-  }
-  {
-    const parts = text
-      .split(/^\s*(?:\d+[.)]|[-*•])\s+/m)
-      .map((p) => p.trim())
-      .filter((p) => p.length >= 20);
-    if (parts.length >= 3) return parts;
-  }
-  {
-    const parts = text
-      .split(/\n\s*\n(?=(?:Dear|Hi|Hello|Dr|Mr|Ms)\b)/)
-      .map((p) => p.trim())
-      .filter((p) => p.length >= 20);
-    if (parts.length) return parts;
-  }
-  return [];
-}
-
+// ---------- v42: /api/suggest-replies — shared template + parser ----------
+// Prompt building and shape parsing live in server/lib/reply-shapes.js
+// (single source of truth with server.js). Accepts optional `instruction`
+// (preset chip OR free-form custom text) fenced inside the fixed template.
 app.post('/api/suggest-replies', async (req, res) => {
   const t = req.body?.thread || {};
+  // v42: optional `instruction` — a preset chip ('warmer') OR free-form
+  // custom text, sanitized and fenced inside the SAME fixed template so the
+  // output contract (JSON array of 4 strings) never changes.
+  const instruction = sanitizeInstruction(req.body?.instruction || req.body?.command || '');
   const started = Date.now();
   const respond = (source, replies, extra = {}) =>
-    res.json({ ok: true, source, replies, count: replies.length, ms: Date.now() - started, ts: new Date().toISOString(), ...extra });
+    res.json({ ok: true, source, replies, count: replies.length, ms: Date.now() - started, ts: new Date().toISOString(), ...(instruction ? { instruction } : {}), ...extra });
   if (!odConfigured()) {
     console.log(JSON.stringify({ level: 'warn', msg: 'api.suggest.offline', reason: 'no-key' }));
     return respond('offline-fallback', offlineSuggestions(t), { degraded: true, reason: 'ONDEMAND_API_KEY not configured' });
   }
-  const buildPrompt = () =>
-    `You draft short professional email replies for MK (CEO) / Meera AlDhaheri (Chief of Staff) at AIREV.\n` +
-    `THREAD: from ${t.sender || 'the counterparty'} <${t.email || 'unknown'}> (${t.org || 'their organisation'}) — subject "${t.subject || '(no subject)'}".\n` +
-    `SITUATION: ${t.summary || t.action || 'They await a reply.'}\n` +
-    `TASK: Write exactly 4 alternative SHORT reply emails (2-4 sentences each, max ~70 words), angles: confirm-and-commit, warm relationship repair, crisp status update, firm-but-polite with a date. ` +
-    `Salutation on its own line, blank line, 1-2 short paragraphs, blank line, then sign off exactly: Warm regards,\nMeera AlDhaheri\nChief of Staff, AIREV\n` +
-    `OUTPUT (STRICT): ONLY a JSON array of 4 strings with \\n escapes. No markdown, no commentary.`;
-  const RETRY_PROMPT =
-    'Your previous output could not be parsed. Return ONLY a raw JSON array of exactly 4 strings — ' +
-    '["reply one","reply two","reply three","reply four"] — each a complete short email with \\n escapes. ' +
-    'ABSOLUTELY no markdown fences, no numbering, no object wrappers, no commentary.';
   try {
     const sid = await odCreateSession({ externalUserId: `mcc-suggest-${Date.now()}` });
-    let r = await odQuerySync(sid, buildPrompt(), { temperature: 0.7 });
+    let r = await odQuerySync(sid, buildSuggestPrompt(t, instruction), { temperature: 0.7 });
     let parsed = r.ok && r.answer ? parseReplyShapes(r.answer) : [];
-    console.log(JSON.stringify({ level: 'info', msg: 'api.suggest.attempt', attempt: 1, parsed: parsed.length }));
+    console.log(JSON.stringify({ level: 'info', msg: 'api.suggest.attempt', attempt: 1, parsed: parsed.length, hasInstruction: Boolean(instruction) }));
     if (parsed.length < 3) {
-      const r2 = await odQuerySync(sid, RETRY_PROMPT, { temperature: 0.5 });
+      const r2 = await odQuerySync(sid, SUGGEST_RETRY_PROMPT, { temperature: 0.5 });
       const parsed2 = r2.ok && r2.answer ? parseReplyShapes(r2.answer) : [];
       console.log(JSON.stringify({ level: 'info', msg: 'api.suggest.attempt', attempt: 2, parsed: parsed2.length }));
       if (parsed2.length > parsed.length) { parsed = parsed2; r = r2; }
