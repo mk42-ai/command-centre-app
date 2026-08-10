@@ -3,6 +3,8 @@ import { TIER_INFO } from './data.js';
 import { toast } from 'sonner';
 import { motion, useReducedMotion } from 'framer-motion';
 import { generateRepliesParallel, refineReply, reviseReplyFreeform, matchDoc, DOCS, MICRO_COMMANDS, sendReply, uploadAttachment, loadSendLog, appendSendLog, DISMISS_OPTIONS, CURRENT_USER, recordDismissal, undoDismissal, loadDismissals } from './ai.js';
+// v43: pure, unit-tested state helpers — the selectability fix lives here.
+import { commitRevision, revisionCommittedState } from './workbenchState.js';
 import Badge, { toneForScore } from './Badge.jsx';
 import Icon from './Icon.jsx';
 
@@ -159,11 +161,17 @@ function ThreadWorkbench({ thread, seq, onResolve, resolvedInfo, onUnresolve }) 
         ? await reviseReplyFreeform(thread, replies[selIdx], c)
         : await refineReply(thread, replies[selIdx], c.toLowerCase());
       setCmd('');
-      runWordStream(revised, (finalText) => {
-        setReplies((rs) => rs.map((r, i) => (i === selIdx ? finalText : r)));
-        setPhase('ready');
-        busyRef.current = false;
-      });
+      // v43 (SELECTABILITY FIX): commit the revised option + ready state
+      // SYNCHRONOUSLY the moment the revision arrives. Previously this
+      // happened only inside the word-reveal interval's completion callback;
+      // if that timer died (background-tab throttling, re-render), a
+      // CUSTOM-refined card stayed 'refining' forever — displayed but not
+      // selectable/approvable/sendable. The reveal below is cosmetic only.
+      setReplies((rs) => commitRevision(rs, selIdx, revised));
+      const committed = revisionCommittedState();
+      setPhase(committed.phase);
+      busyRef.current = committed.busy;
+      runWordStream(revised, () => { /* cosmetic reveal only — state already committed */ });
     } catch (e) {
       toast.error('Revision failed', { description: String(e.message || e).slice(0, 120) });
       setErr(`Revision failed (${String(e.message || e)}).`);

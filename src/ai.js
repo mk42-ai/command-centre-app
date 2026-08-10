@@ -5,6 +5,9 @@
 // same-origin and under the OnDemand /apps/<name> path prefix.
 // ============================================================
 import { API_BASE } from './backend.js';
+// v43: shared pure payload builder (unit-tested) — single source of truth
+// for the /api/send body shape.
+import { buildSendPayload } from './workbenchState.js';
 
 // ---------- frequently-requested documents (auto-attach flow) ----------
 export const DOCS = [
@@ -753,31 +756,17 @@ export function validRecipient(thread) {
   return _EMAIL_RE.test(e) ? e : null;
 }
 export async function sendReply(thread, replyBody, attachments = []) {
-  // v27: client-side selection→payload mapping guard — the approved body and a
-  // VALID recipient must exist before we ever hit /api/send. Seed threads with
-  // placeholder emails ('various') and no Zoho messageId fail fast with a
-  // clear message instead of dispatching a broken prompt.
-  const body = String(replyBody || '').trim();
-  if (!body) throw new Error('approved reply body is empty — approve a reply before sending');
-  const recipient = validRecipient(thread);
-  if (!recipient && !thread?.zoho?.messageId) {
-    throw new Error(`no valid recipient for this thread (email: ${JSON.stringify(thread?.email || null)}) — cannot send`);
-  }
+  // v43: the payload (and its v27 guards — non-empty body, valid recipient or
+  // thread messageId) is built by the SHARED pure helper so the unit tests
+  // exercise the exact production mapping. Throws the same clear errors.
+  const payload = buildSendPayload(thread, replyBody, attachments);
   // v24: explicit approval attestation — this function is ONLY reachable from
   // the two-step confirmed Send action in the Workbench; the header is what
   // the server-side approval gate requires (403 dry-run without it).
   const r = await fetch(`${API_BASE}/api/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-send-approved': 'true' },
-    body: JSON.stringify({
-      sendApproved: true,
-      replyBody: body,
-      zohoMessageId: thread?.zoho?.messageId || null,
-      zohoFolderId: thread?.zoho?.folderId || null,
-      threadSubject: thread.subject,
-      toAddress: recipient,  // v27: validated email or null — never 'various'
-      attachments: (attachments || []).map((d) => ({ id: d.id, name: d.fileName || d.label, url: d.url })),
-    }),
+    body: JSON.stringify(payload),
   });
   const j = await r.json().catch(() => ({}));
   // v25 (C5): the approval-gate 403 is a structured dry-run, not a generic
